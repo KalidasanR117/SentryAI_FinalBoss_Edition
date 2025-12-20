@@ -2,48 +2,59 @@
 from ultralytics import YOLO
 import numpy as np
 
-class PoseDetector:
+class Detector:
     def __init__(self,
-                 model_path=r"D:\\Sentry_Final_Form\\sentry\\models\\yolo11l-pose.pt",
+                 pose_model="D:\Sentry_Final_Form\sentry\models\yolo11l-pose.pt",
+                 obj_model="D:\Sentry_Final_Form\sentry\models\yolo11m.pt",
                  device="cuda"):
-        """
-        YOLOv11 Pose Detector with ByteTrack
-        """
-        self.model = YOLO(model_path).to(device)
-        self.model.fuse()
-        self.device = device
+        self.pose_model = YOLO(pose_model).to(device)
+        self.obj_model  = YOLO(obj_model).to(device)
+        self.pose_model.fuse()
+        self.obj_model.fuse()
 
     def infer(self, frame):
-        """
-        Returns list of dicts:
-        {
-          "track_id": int,
-          "keypoints": (17,2),
-          "confidence": (17,)
-        }
-        """
-        results = self.model.track(
+        persons, objects = [], []
+
+        # ==== POSE ====
+        pose_results = self.pose_model.track(
             frame,
-            tracker="bytetrack.yaml",
             persist=True,
+            tracker="bytetrack.yaml",
             verbose=False
         )
 
-        detections = []
-
-        for r in results:
+        for r in pose_results:
             if r.keypoints is None or r.boxes.id is None:
                 continue
 
-            keypoints = r.keypoints.xy.cpu().numpy()     # (N,17,2)
-            confs     = r.keypoints.conf.cpu().numpy()   # (N,17)
-            track_ids = r.boxes.id.cpu().numpy()         # (N,)
+            for i in range(len(r.boxes.id)):
+                kpts = r.keypoints.xy[i].cpu().numpy()
+                conf = r.keypoints.conf[i].cpu().numpy()
+                tid  = int(r.boxes.id[i])
 
-            for i in range(len(track_ids)):
-                detections.append({
-                    "track_id": int(track_ids[i]),
-                    "keypoints": keypoints[i],
-                    "confidence": confs[i]
+                persons.append({
+                    "track_id": tid,
+                    "keypoints": kpts,
+                    "confidence": conf
                 })
 
-        return detections
+        # ==== OBJECTS ====
+        obj_results = self.obj_model.track(
+            frame,
+            persist=True,
+            tracker="bytetrack.yaml",
+            verbose=False
+        )
+
+        for r in obj_results:
+            if r.boxes.id is None:
+                continue
+            for i in range(len(r.boxes.id)):
+                objects.append({
+                    "track_id": int(r.boxes.id[i]),
+                    "cls": int(r.boxes.cls[i]),
+                    "conf": float(r.boxes.conf[i]),
+                    "bbox": r.boxes.xyxy[i].cpu().numpy()
+                })
+
+        return persons, objects
