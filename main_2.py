@@ -16,6 +16,8 @@ from utils.visualization import draw_pose
 from facial_analysis.models import SCRFD
 from facial_analysis.utils.helpers import Face, draw_face_info
 
+
+
 warnings.filterwarnings("ignore")
 
 # ===========================
