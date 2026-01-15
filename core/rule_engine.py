@@ -1,3 +1,4 @@
+# sentry/core/rule_engine.py
 import numpy as np
 from collections import defaultdict, deque
 
@@ -75,10 +76,10 @@ class RuleEngine:
             avg_torso = np.mean([m[1] for m in motions])
 
             # classify based on sequence features
-            if avg_hand>15 and avg_torso>5:
+            if avg_hand>20 and avg_torso>7:             #15   5
                 action="Physical Assault"
                 sev="CRITICAL"
-            elif avg_hand>10 and avg_torso>3:
+            elif avg_hand>12 and avg_torso>4:           #10   3 
                 action="Aggressive Interaction"
                 sev="HIGH"
             else:
