@@ -231,10 +231,18 @@ def process_face_recognition(frame, scrfd, arcface, face_db, cache, next_face_id
 
         detected_names.append(name)  # ✅ FIX: collect names
 
+        if name in BLACKLIST:
+            status = "blacklist"
+        elif name in WHITELIST:
+            status = "whitelist"
+        else:
+            status = None
+
         new_cache[matched_id] = {
             "bbox": bbox,
             "emb": emb,
-            "name": name
+            "name": name,
+            "status": status
         }
 
         # -------- Identity annotation --------
@@ -260,10 +268,24 @@ def process_face_recognition(frame, scrfd, arcface, face_db, cache, next_face_id
         )
 
     # ✅ SAFE blacklist extraction
-    blacklisted_faces = list({n for n in detected_names if n in BLACKLIST})
+    face_results = {}
 
-    return frame, new_cache, next_face_id, blacklisted_faces
+    for fid, data in new_cache.items():
+        face_results[fid] = {
+            "bbox": data["bbox"],
+            "name": data["name"],
+            "status": data["status"]
+        }
 
+    return frame, new_cache, next_face_id, face_results
+
+
+def bbox_from_keypoints(kps):
+    pts = [p[:2] for p in kps if p[0] > 0 and p[1] > 0]
+    if not pts:
+        return None
+    xs, ys = zip(*pts)
+    return [min(xs), min(ys), max(xs), max(ys)]
 
 # ============================================================
 # MAIN LOOP
@@ -307,9 +329,28 @@ def run(source=0, scrfd_weights=None, arcface_weights=None,
         rule_results = rule_engine.update(persons, objects)
         theft_events = theft_detector.detect(persons, objects)
 
-        frame, cache, next_face_id = process_face_recognition(
-            frame, scrfd, arcface, face_db, cache, next_face_id
-        )
+        frame, cache, next_face_id, face_results = process_face_recognition(
+        frame, scrfd, arcface, face_db, cache, next_face_id)
+                # ---------------- FACE ↔ POSE LINKING ----------------
+        track_to_face = {}
+
+        for p in persons:
+            pose_bbox = bbox_from_keypoints(p["keypoints"])
+            if pose_bbox is None:
+                continue
+
+            best_iou = 0.0
+            best_face = None
+
+            for f in face_results.values():
+                i = iou(pose_bbox, f["bbox"])
+                if i > best_iou and i > 0.3:
+                    best_iou = i
+                    best_face = f
+
+            if best_face:
+                track_to_face[p["track_id"]] = best_face
+
 
         frame_out = draw_pose(frame.copy(), [
             {
@@ -323,6 +364,18 @@ def run(source=0, scrfd_weights=None, arcface_weights=None,
             tid = p["track_id"]
             if tid in rule_results:
                 r = rule_results[tid]
+                face_info = track_to_face.get(tid)
+
+                if face_info:
+                    if face_info["status"] == "whitelist" and r["severity"] == "MEDIUM":
+                        r["action"] += " (Whitelisted)"
+                        r["severity"] = "LOW"
+                        r["color"] = (0, 255, 0)
+
+                    elif face_info["status"] == "blacklist":
+                        r["severity"] = "CRITICAL"
+                        r["color"] = (0, 0, 255)
+
                 x, y = map(int, p["keypoints"][0])
                 cv2.putText(
                     frame_out,

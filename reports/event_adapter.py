@@ -1,6 +1,11 @@
 # sentry/reports/event_adapter.py
 import os
 import cv2
+SKIP_EVENT_TYPES = {
+    "Tracking",
+    "Normal",
+    "Normal Motion"
+}
 
 def severity_to_final(severity):
     if severity in ["CRITICAL", "HIGH"]:
@@ -21,18 +26,21 @@ def adapt_events_for_pdf(events, frame_store):
     pdf_events = []
 
     for e in events:
+        # 🚫 Skip non-reportable runtime states
+        if e.get("type") in SKIP_EVENT_TYPES:
+            continue
+
         pdf_events.append({
             "frame": e.get("start_time"),
             "type": e.get("type"),
-            "final": (
-                "danger" if e["severity"] in ["CRITICAL", "HIGH"]
-                else "suspicious"
-            ),
+            "final": severity_to_final(e["severity"]),
             "confidence": e.get("confidence"),
             "persons": e.get("persons"),
             "cause": e.get("cause"),
-            "screenshot": e.get("screenshot")  # ✅ THIS IS THE KEY
+            "screenshot": e.get("screenshot")
         })
+
+    return pdf_events
 
     return pdf_events
 def pick_representative_frames(event, max_frames=3):
