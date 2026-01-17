@@ -1,5 +1,5 @@
 .*
 !.gitignore
 !.gitattributes
-*.jgf
+*.jpg
 *.pdf

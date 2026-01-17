@@ -275,12 +275,14 @@ def run_live(source):
 
     event_buffer = adapt_events_for_pdf(events, frame_store)
 
-    summary_text = (
-        "This report summarizes significant pose-based events detected "
-        "during live surveillance. Events are generated using joint-level "
-        "motion analysis and biologically-inspired rule-based reasoning "
-        "to ensure full explainability."
+    from llm.summary_generator import generate_llm_summary
+
+    summary_text = generate_llm_summary(
+        events=event_buffer,
+        mode="LIVE"
     )
+
+
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(
@@ -430,11 +432,13 @@ def run_offline(video_path):
         screenshot_dir=OFFLINE_SCREENSHOT_DIR
     )
 
-    summary_text = (
-        "This report summarizes offline video analysis performed by Sentry AI "
-        "using transformer-based spatiotemporal modeling (VideoMAE). "
-        "Events are detected based on temporal violence patterns."
+    from llm.summary_generator import generate_llm_summary
+
+    summary_text = generate_llm_summary(
+        events=events,
+        mode="OFFLINE"
     )
+
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_pdf = os.path.join(
