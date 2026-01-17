@@ -23,6 +23,7 @@ from core.rule_engine import RuleEngine
 from core.theft_detector import TheftDetector
 from utils.visualization import draw_pose
 from facial_analysis.models import SCRFD
+from events.event_manager import EventManager
 
 # ========================= FACE PIPELINE (CACHED) =========================
 from pose_face_main import (
@@ -46,6 +47,13 @@ FRAME_SIZE = (224, 224)
 LOW_VIOLENCE = 0.55
 HIGH_VIOLENCE = 0.85
 DANCE_SIM_THRESHOLD = 0.85
+# ========================= PATHS =========================
+SENTRY_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPORTS_DIR = os.path.join(SENTRY_ROOT, "reports")
+SCREENSHOT_DIR = os.path.join(REPORTS_DIR, "screenshots")
+
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+# ========================================================
 
 DANCE_DIR = "sentry/tests/dance"
 # ========================================================
@@ -108,11 +116,10 @@ def load_or_build_dance_embeddings(dance_dir, extract_embedding, device):
     return dance_embs.to(device)
 # ==========================================================
 
-
-# ========================= MODE 1: LIVE =========================
 def run_live(source):
     print("[MODE] LIVE")
 
+    # ===================== INIT MODELS =====================
     scrfd = SCRFD(model_path=SCRFD_MODEL)
     arcface = ort.InferenceSession(
         ARCFACE_MODEL,
@@ -124,65 +131,174 @@ def run_live(source):
     detector = Detector()
     pose_buffer = PoseBuffer(max_len=30)
     rule_engine = RuleEngine(history=30)
-    theft_detector = TheftDetector(static_thresh=8, corr_thresh=60)
 
+    # ===================== VIDEO =====================
+    cap = cv2.VideoCapture(source)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+
+    event_mgr = EventManager(fps=fps, source="LIVE")
+
+    frame_idx = 0
+    prev_time = time.time()
+
+    # Face tracking cache
     cache = {}
     next_face_id = 0
 
-    cap = cv2.VideoCapture(source)
-    prev = time.time()
+    # Sparse frame store (1 frame/sec backup)
+    frame_store = {}
 
+    # ===================== MAIN LOOP =====================
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
+        # Store 1 frame per second (fallback)
+        if frame_idx % int(fps) == 0:
+            frame_store[frame_idx] = frame.copy()
+
+        # ---------- Detection ----------
         persons, objects = detector.infer(frame)
+
         for p in persons:
             pose_buffer.update(p["track_id"], p["keypoints"])
 
+        # ---------- Rule Engine ----------
         rule_results = rule_engine.update(persons, objects)
-        theft_events = theft_detector.detect(persons, objects)
 
+        # ---------- Face Recognition ----------
         frame, cache, next_face_id = process_face_recognition(
             frame, scrfd, arcface, face_db, cache, next_face_id
         )
 
-        frame_out = draw_pose(frame.copy(), [
-            {
+        # ---------- Draw Pose ----------
+        frame_out = draw_pose(
+            frame.copy(),
+            [{
                 "keypoints": p["keypoints"],
                 "confidence": np.ones(len(p["keypoints"])),
                 "track_id": p["track_id"]
-            } for p in persons
-        ])
+            } for p in persons]
+        )
+
+        # ---------- EVENT HANDLING ----------
+        active_event_this_frame = False
 
         for p in persons:
-            if p["track_id"] in rule_results:
-                r = rule_results[p["track_id"]]
+            tid = p["track_id"]
+
+            if tid in rule_results:
+                r = rule_results[tid]
+                active_event_this_frame = True
+
+                # Save screenshot ONLY when event starts
+                screenshot_path = None
+                if (
+                    event_mgr.current_event is None or
+                    event_mgr.current_event["type"] != r["action"]
+                ):
+                    screenshot_path = os.path.join(
+                        SCREENSHOT_DIR,
+                        f"event_{frame_idx}_track_{tid}.jpg"
+                    )
+                    cv2.imwrite(screenshot_path, frame_out)
+
+                event_mgr.update(
+                    frame_idx=frame_idx,
+                    label=r["action"],
+                    severity=r["severity"],
+                    confidence=None,
+                    face_ids=[tid],
+                    override=None,
+                    cause=r.get("cause"),
+                    screenshot=screenshot_path
+                )
+
+                # Overlay label
                 x, y = map(int, p["keypoints"][0])
-                cv2.putText(frame_out, r["action"], (x, y - 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, r["color"], 2)
+                cv2.putText(
+                    frame_out,
+                    r["action"],
+                    (x, y - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    r["color"],
+                    2
+                )
 
-        if theft_events:
-            cv2.putText(frame_out, "THEFT DETECTED", (50, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+        # ---------- NORMAL (ONLY ONCE PER FRAME) ----------
+        if not active_event_this_frame:
+            event_mgr.update(
+                frame_idx=frame_idx,
+                label="Normal",
+                severity="LOW"
+            )
 
-        fps = 1 / (time.time() - prev + 1e-8)
-        prev = time.time()
-        cv2.putText(frame_out, f"FPS: {int(fps)}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # ---------- FPS ----------
+        now = time.time()
+        fps_val = 1 / (now - prev_time + 1e-8)
+        prev_time = now
+
+        cv2.putText(
+            frame_out,
+            f"FPS: {int(fps_val)}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2
+        )
 
         cv2.imshow("Sentry LIVE", frame_out)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
+        frame_idx += 1
+
+    # ===================== CLEANUP =====================
     cap.release()
     cv2.destroyAllWindows()
-# =============================================================
+
+    # ===================== FINALIZE EVENTS =====================
+    event_mgr.finalize()
+    events = event_mgr.export()
+
+    print("\n=== FINAL EVENT TIMELINE ===")
+    for e in events:
+        print(e)
+
+    # ===================== PDF REPORT =====================
+    from reports.event_adapter import adapt_events_for_pdf
+    from reports.pdf_report import generate_pdf_report
+    from datetime import datetime
+
+    event_buffer = adapt_events_for_pdf(events, frame_store)
+
+    summary_text = (
+        "This report summarizes significant pose-based events detected "
+        "during live surveillance. Events are generated using joint-level "
+        "motion analysis and biologically-inspired rule-based reasoning "
+        "to ensure full explainability."
+    )
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(
+        REPORTS_DIR,
+        f"sentry_live_report_{ts}.pdf"
+    )
+
+    generate_pdf_report(event_buffer, summary_text, output_path)
+
+    print(f"\n[REPORT] Generated → {output_path}")
 
 
 # ========================= MODE 2: OFFLINE =========================
 def run_offline(video_path):
+    OFFLINE_REPORT_DIR = os.path.join(REPORTS_DIR, "offline")
+    OFFLINE_SCREENSHOT_DIR = os.path.join(OFFLINE_REPORT_DIR, "screenshots")
+    os.makedirs(OFFLINE_SCREENSHOT_DIR, exist_ok=True)
+
     print("[MODE] OFFLINE")
 
     IS_DANCE_VIDEO = is_dance_video(video_path, DANCE_DIR)
@@ -302,6 +418,33 @@ def run_offline(video_path):
             break
 
         idx += 1
+    from events.offline_event_builder import build_offline_events
+    from reports.pdf_report import generate_pdf_report
+    from datetime import datetime
+
+    events = build_offline_events(
+        frames=frames,
+        labels=labels,
+        scores=scores,
+        fps=fps,
+        screenshot_dir=OFFLINE_SCREENSHOT_DIR
+    )
+
+    summary_text = (
+        "This report summarizes offline video analysis performed by Sentry AI "
+        "using transformer-based spatiotemporal modeling (VideoMAE). "
+        "Events are detected based on temporal violence patterns."
+    )
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_pdf = os.path.join(
+        OFFLINE_REPORT_DIR,
+        f"sentry_offline_report_{ts}.pdf"
+    )
+
+    generate_pdf_report(events, summary_text, output_pdf)
+
+    print(f"[OFFLINE REPORT] Generated -> {output_pdf}")
 
     cap.release()
     cv2.destroyAllWindows()
