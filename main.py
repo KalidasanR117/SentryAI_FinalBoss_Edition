@@ -154,7 +154,7 @@ def run_live(source):
         if not ret:
             break
 
-        # Store 1 frame per second (fallback)
+        # Store fallback frame
         if frame_idx % int(fps) == 0:
             frame_store[frame_idx] = frame.copy()
 
@@ -168,7 +168,7 @@ def run_live(source):
         rule_results = rule_engine.update(persons, objects)
 
         # ---------- Face Recognition ----------
-        frame, cache, next_face_id = process_face_recognition(
+        frame, cache, next_face_id, blacklisted_faces = process_face_recognition(
             frame, scrfd, arcface, face_db, cache, next_face_id
         )
 
@@ -182,7 +182,32 @@ def run_live(source):
             } for p in persons]
         )
 
-        # ---------- EVENT HANDLING ----------
+        # ================= BLACKLIST EVENT =================
+        if blacklisted_faces:
+            screenshot_path = os.path.join(
+                SCREENSHOT_DIR,
+                f"blacklist_{frame_idx}.jpg"
+            )
+            cv2.imwrite(screenshot_path, frame_out)
+
+            event_mgr.update(
+                frame_idx=frame_idx,
+                label="Blacklisted Person Detected",
+                severity="CRITICAL",
+                confidence=1.0,
+                face_ids=blacklisted_faces,
+                override="BLACKLIST",
+                cause={
+                    "trigger": "FACE_RECOGNITION",
+                    "rule_name": "BLACKLIST_MATCH",
+                    "description": "Known blacklisted individual detected",
+                    "joints_involved": [],
+                    "metrics": {"faces": blacklisted_faces}
+                },
+                screenshot=screenshot_path
+            )
+
+        # ================= POSE EVENTS =================
         active_event_this_frame = False
 
         for p in persons:
@@ -192,7 +217,7 @@ def run_live(source):
                 r = rule_results[tid]
                 active_event_this_frame = True
 
-                # Save screenshot ONLY when event starts
+                # Save screenshot ONLY if event starts
                 screenshot_path = None
                 if (
                     event_mgr.current_event is None or
@@ -227,8 +252,8 @@ def run_live(source):
                     2
                 )
 
-        # ---------- NORMAL (ONLY ONCE PER FRAME) ----------
-        if not active_event_this_frame:
+        # ---------- NORMAL ----------
+        if not active_event_this_frame and not blacklisted_faces:
             event_mgr.update(
                 frame_idx=frame_idx,
                 label="Normal",
@@ -271,18 +296,15 @@ def run_live(source):
     # ===================== PDF REPORT =====================
     from reports.event_adapter import adapt_events_for_pdf
     from reports.pdf_report import generate_pdf_report
+    from llm.summary_generator import generate_llm_summary
     from datetime import datetime
 
     event_buffer = adapt_events_for_pdf(events, frame_store)
-
-    from llm.summary_generator import generate_llm_summary
 
     summary_text = generate_llm_summary(
         events=event_buffer,
         mode="LIVE"
     )
-
-
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(
@@ -297,6 +319,11 @@ def run_live(source):
 
 # ========================= MODE 2: OFFLINE =========================
 def run_offline(video_path):
+    from datetime import datetime
+    from events.offline_event_builder import build_offline_events
+    from reports.pdf_report import generate_pdf_report
+    from llm.summary_generator import generate_llm_summary
+
     OFFLINE_REPORT_DIR = os.path.join(REPORTS_DIR, "offline")
     OFFLINE_SCREENSHOT_DIR = os.path.join(OFFLINE_REPORT_DIR, "screenshots")
     os.makedirs(OFFLINE_SCREENSHOT_DIR, exist_ok=True)
@@ -304,8 +331,6 @@ def run_offline(video_path):
     print("[MODE] OFFLINE")
 
     IS_DANCE_VIDEO = is_dance_video(video_path, DANCE_DIR)
-    # if IS_DANCE_VIDEO:
-    #     print("[OFFLINE] HARD DANCE WHITELIST ENABLED")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -314,8 +339,10 @@ def run_offline(video_path):
         VIDEOMAE_MODEL
     ).to(device).eval()
 
-    fight_idx = [k for k, v in model.config.id2label.items()
-                 if v.lower() == "fight"][0]
+    fight_idx = [
+        k for k, v in model.config.id2label.items()
+        if v.lower() == "fight"
+    ][0]
 
     def extract_embedding(clip):
         inputs = processor(clip, return_tensors="pt")
@@ -329,6 +356,7 @@ def run_offline(video_path):
         DANCE_DIR, extract_embedding, device
     )
 
+    # ---------- Face Models ----------
     scrfd = SCRFD(model_path=SCRFD_MODEL)
     arcface = ort.InferenceSession(
         ARCFACE_MODEL,
@@ -336,8 +364,10 @@ def run_offline(video_path):
     )
     face_db = load_or_build_face_db(scrfd, arcface, FACE_GALLERY)
 
+    # ---------- Load Video ----------
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+
     frames = []
     while True:
         ret, f = cap.read()
@@ -349,6 +379,10 @@ def run_offline(video_path):
     labels = ["Normal"] * len(frames)
     scores = np.zeros(len(frames))
 
+    # Track blacklist frames
+    blacklist_frames = {}
+
+    # ---------- VideoMAE Inference ----------
     for i in range(0, len(frames) - NUM_FRAMES, STRIDE):
         clip = [
             cv2.resize(cv2.cvtColor(x, cv2.COLOR_BGR2RGB), FRAME_SIZE)
@@ -356,7 +390,9 @@ def run_offline(video_path):
         ]
 
         emb = extract_embedding(clip)
-        sim = cosine_similarity(emb.unsqueeze(0), dance_embs).max().item()
+        sim = cosine_similarity(
+            emb.unsqueeze(0), dance_embs
+        ).max().item()
 
         inputs = processor(clip, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -368,62 +404,28 @@ def run_offline(video_path):
         for j in range(i, i + NUM_FRAMES):
             scores[j] = max(scores[j], fight_score)
 
-            # ===== HARD OVERRIDE =====
             if IS_DANCE_VIDEO:
                 labels[j] = "Dance"
-                continue
-            # ========================
-
-            if fight_score > HIGH_VIOLENCE:
+            elif fight_score > HIGH_VIOLENCE:
                 labels[j] = "Fight"
             elif fight_score > LOW_VIOLENCE:
                 labels[j] = "Fight (Low Confidence)"
             else:
                 labels[j] = "Normal"
 
-    cap = cv2.VideoCapture(video_path)
+    # ---------- Face Recognition Pass ----------
     cache = {}
     next_face_id = 0
-    idx = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame, cache, next_face_id = process_face_recognition(
+    for idx, frame in enumerate(frames):
+        _, cache, next_face_id, blacklisted_faces = process_face_recognition(
             frame, scrfd, arcface, face_db, cache, next_face_id
         )
 
-        label = labels[idx]
-        score = scores[idx]
+        if blacklisted_faces:
+            blacklist_frames[idx] = blacklisted_faces
 
-        if "Dance" in label:
-            color = (255, 200, 0)
-        elif "Fight" in label:
-            color = (0, 0, 255)
-        else:
-            color = (0, 255, 0)
-
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0),
-                      (frame.shape[1], frame.shape[0]),
-                      color, -1)
-        frame = cv2.addWeighted(overlay, 0.25, frame, 0.75, 0)
-
-        cv2.putText(frame, f"{label} | {score:.2f}",
-                    (30, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.1, color, 3)
-
-        cv2.imshow("Sentry OFFLINE", frame)
-        if cv2.waitKey(int(1000 / fps)) & 0xFF == ord("q"):
-            break
-
-        idx += 1
-    from events.offline_event_builder import build_offline_events
-    from reports.pdf_report import generate_pdf_report
-    from datetime import datetime
-
+    # ---------- Build Offline Events ----------
     events = build_offline_events(
         frames=frames,
         labels=labels,
@@ -432,13 +434,32 @@ def run_offline(video_path):
         screenshot_dir=OFFLINE_SCREENSHOT_DIR
     )
 
-    from llm.summary_generator import generate_llm_summary
+    # ---------- BLACKLIST OVERRIDE ----------
+    for e in events:
+        start_f = int(e["start_time"] * fps)
+        end_f = int(e["end_time"] * fps)
 
+        detected = set()
+        for f in range(start_f, end_f + 1):
+            if f in blacklist_frames:
+                detected.update(blacklist_frames[f])
+
+        if detected:
+            e["final"] = "danger"
+            e["type"] = "Blacklisted Person Detected"
+            e["cause"] = {
+                "trigger": "FACE_RECOGNITION",
+                "rule_name": "BLACKLIST_MATCH",
+                "description": "Known blacklisted individual detected",
+                "joints_involved": [],
+                "metrics": {"faces": list(detected)}
+            }
+
+    # ---------- LLM SUMMARY ----------
     summary_text = generate_llm_summary(
         events=events,
-        mode="OFFLINE"
+        mode="OFFLINE"  
     )
-
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_pdf = os.path.join(
@@ -448,10 +469,8 @@ def run_offline(video_path):
 
     generate_pdf_report(events, summary_text, output_pdf)
 
-    print(f"[OFFLINE REPORT] Generated -> {output_pdf}")
+    print(f"[OFFLINE REPORT] Generated → {output_pdf}")
 
-    cap.release()
-    cv2.destroyAllWindows()
 # =============================================================
 
 

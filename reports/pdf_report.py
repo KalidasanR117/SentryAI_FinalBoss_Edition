@@ -3,9 +3,13 @@ from fpdf import FPDF
 from datetime import datetime
 from PIL import Image
 
+
 # ============================================================
 # Professional PDF Report Generator – Sentry AI
 # ============================================================
+
+KNOWN_SAFE = lambda s: str(s).encode("latin-1", "ignore").decode("latin-1")
+
 
 class PDFReport(FPDF):
 
@@ -59,15 +63,16 @@ class PDFReport(FPDF):
             y = (ph - h) / 2
             self.image(cover_path, x=x, y=y, w=w, h=h)
         else:
-            self.set_text_color(*self.COLOR_WHITE)
             self.set_font("Helvetica", "B", 24)
+            self.set_text_color(*self.COLOR_WHITE)
             self.cell(0, 20, "Sentry AI Report", ln=True, align="C")
 
     # ---------------- Summary ----------------
     def add_summary_page(self, summary, events):
         self.add_page()
-        self.set_text_color(*self.COLOR_WHITE)
+
         self.set_font("Helvetica", "B", 22)
+        self.set_text_color(*self.COLOR_WHITE)
         self.cell(0, 14, "Executive Summary", ln=True)
 
         self.set_draw_color(*self.COLOR_GOLD)
@@ -77,12 +82,12 @@ class PDFReport(FPDF):
 
         self.set_font("Helvetica", "", 12)
         self.set_text_color(*self.COLOR_LIGHT_GREY)
-        self.multi_cell(0, 8, summary)
-        self.ln(8)
+        self.multi_cell(0, 8, KNOWN_SAFE(summary))
 
         danger = len([e for e in events if e.get("final") == "danger"])
         suspicious = len([e for e in events if e.get("final") == "suspicious"])
 
+        self.ln(8)
         self.set_font("Helvetica", "B", 13)
         self.set_text_color(*self.COLOR_WHITE)
         self.cell(0, 10, "Key Findings", ln=True)
@@ -96,6 +101,7 @@ class PDFReport(FPDF):
     # ---------------- Timeline ----------------
     def add_timeline_page(self, events):
         self.add_page()
+
         self.set_font("Helvetica", "B", 22)
         self.set_text_color(*self.COLOR_WHITE)
         self.cell(0, 14, "Event Timeline", ln=True)
@@ -108,40 +114,27 @@ class PDFReport(FPDF):
             start = e.get("start_time", "?")
             etype = e.get("type", "Unknown")
             sev = e.get("final", "normal").upper()
-            text = f"[{start}s] {etype} ({sev})"
-            self.multi_cell(0, 8, text)
-            self.ln(1)
+            self.multi_cell(0, 8, f"[{start}s] {KNOWN_SAFE(etype)} ({sev})")
 
     # ---------------- Event Page ----------------
     def add_event_details(self, event):
         self.add_page()
 
-        # Title
+        # ---------- Title ----------
         self.set_font("Helvetica", "B", 16)
         self.set_text_color(*self.COLOR_WHITE)
         self.cell(
             0, 10,
-            f"Event Details - Frame {event.get('frame', 'N/A')}",
+            f"Event Details - {KNOWN_SAFE(event.get('type', 'Event'))}",
             ln=True
         )
         self.ln(4)
 
-        # ---- Table ----
+        # ---------- Table ----------
         col1 = 50
         col2 = self.w - self.l_margin - self.r_margin - col1
 
         self.set_draw_color(*self.COLOR_BORDER)
-
-        self.set_font("Helvetica", "B", 11)
-        self.cell(col1, 8, "Detection Type", 1)
-        self.set_font("Helvetica", "", 11)
-        self.cell(col2, 8, "Details", 1, ln=True)
-
-        self.set_font("Helvetica", "B", 11)
-        self.cell(col1, 8, "Violence Detected", 1)
-        self.set_font("Helvetica", "", 11)
-        self.cell(col2, 8, event.get("type", "None"), 1, ln=True)
-
         self.set_font("Helvetica", "B", 11)
         self.cell(col1, 8, "Final Severity", 1)
 
@@ -153,38 +146,40 @@ class PDFReport(FPDF):
         else:
             self.set_text_color(160, 255, 160)
 
-        self.set_font("Helvetica", "B", 11)
         self.cell(col2, 8, sev.upper(), 1, ln=True)
         self.set_text_color(*self.COLOR_LIGHT_GREY)
         self.ln(6)
 
-        # ---- Visual Evidence ----
+        # ---------- Screenshots ----------
+        screenshots = event.get("screenshots") or []
+        if event.get("screenshot"):
+            screenshots = [event["screenshot"]]
+
         self.set_font("Helvetica", "B", 14)
         self.set_text_color(*self.COLOR_WHITE)
         self.cell(0, 10, "Visual Evidence", ln=True)
 
-        img = event.get("screenshot")
         x = self.l_margin
         y = self.get_y()
+        w = 60
+        h = 45
 
-        if img and os.path.exists(img):
-            self.image(img, x=x, y=y, w=90)
-            self.set_xy(x + 95, y)
-            self.set_font("Helvetica", "I", 11)
-            self.multi_cell(90, 10, "Skeletal Structure\n(Pose / 3D View)")
-            self.ln(65)
-        else:
-            self.set_font("Helvetica", "I", 10)
-            self.cell(0, 8, "Screenshot not available", ln=True)
+        for i, img in enumerate(screenshots[:3]):
+            if os.path.exists(img):
+                self.image(img, x + i*(w+5), y, w=w, h=h)
 
-        # ---- Explainability ----
+        self.set_y(y + h + 10)
+
+        # ---------- Explainability ----------
         cause = event.get("cause")
         if cause:
-            self.ln(5)
             self.set_font("Helvetica", "B", 14)
+            self.set_text_color(*self.COLOR_WHITE)
             self.cell(0, 10, "Why this event was detected", ln=True)
 
             self.set_font("Helvetica", "", 11)
+            self.set_text_color(*self.COLOR_LIGHT_GREY)
+
             text = (
                 f"Trigger Source : {cause.get('trigger')}\n"
                 f"Rule Name      : {cause.get('rule_name')}\n"
@@ -192,7 +187,8 @@ class PDFReport(FPDF):
                 f"Joints         : {', '.join(cause.get('joints_involved', []))}\n"
                 f"Metrics        : {cause.get('metrics')}"
             )
-            self.multi_cell(0, 7, text)
+
+            self.multi_cell(0, 7, KNOWN_SAFE(text))
 
 
 # ============================================================
@@ -216,4 +212,4 @@ def generate_pdf_report(event_buffer, summary_text, output_path):
         pdf.add_event_details(e)
 
     pdf.output(output_path)
-    print(f"[PDF] Report generated -> {output_path}")
+    print(f"[PDF] Report generated → {output_path}")

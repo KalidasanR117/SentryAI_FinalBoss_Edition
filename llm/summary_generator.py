@@ -64,6 +64,8 @@ def generate_llm_summary(events, mode="LIVE", model="mistral"):
             input=prompt,
             capture_output=True,
             text=True,
+            errors="ignore", 
+            encoding="utf-8",      
             timeout=60
         )
 

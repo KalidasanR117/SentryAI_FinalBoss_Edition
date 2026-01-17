@@ -35,3 +35,16 @@ def adapt_events_for_pdf(events, frame_store):
         })
 
     return pdf_events
+def pick_representative_frames(event, max_frames=3):
+    frames = event.get("frames", [])
+    if not frames:
+        return []
+
+    if len(frames) <= max_frames:
+        return frames
+
+    return [
+        frames[0],                 # start
+        frames[len(frames)//2],    # middle
+        frames[-1]                 # end
+    ]

@@ -27,8 +27,8 @@ warnings.filterwarnings("ignore")
 FACE_GALLERY = "sentry/facial_analysis/face_gallery"
 
 WHITELIST = {
-    "kalidasan",
     "Akshay",
+    "kalidasan",
     "Mridul"
 }
 
@@ -196,6 +196,7 @@ def process_face_recognition(frame, scrfd, arcface, face_db, cache, next_face_id
 
     new_cache = {}
     used_ids = set()
+    detected_names = []   # ✅ FIX: track all detected names
 
     for boxes, kps in zip(boxes_list, points_list):
         *bbox, _ = boxes
@@ -228,13 +229,15 @@ def process_face_recognition(frame, scrfd, arcface, face_db, cache, next_face_id
             matched_id = next_face_id
             next_face_id += 1
 
+        detected_names.append(name)  # ✅ FIX: collect names
+
         new_cache[matched_id] = {
             "bbox": bbox,
             "emb": emb,
             "name": name
         }
 
-        # -------- Identity annotation (SAFE) --------
+        # -------- Identity annotation --------
         if name in BLACKLIST:
             color = (0, 0, 255)
             tag = "BLACKLIST"
@@ -256,7 +259,11 @@ def process_face_recognition(frame, scrfd, arcface, face_db, cache, next_face_id
             2
         )
 
-    return frame, new_cache, next_face_id
+    # ✅ SAFE blacklist extraction
+    blacklisted_faces = list({n for n in detected_names if n in BLACKLIST})
+
+    return frame, new_cache, next_face_id, blacklisted_faces
+
 
 # ============================================================
 # MAIN LOOP
