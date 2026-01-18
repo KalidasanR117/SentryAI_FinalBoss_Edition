@@ -5,8 +5,9 @@ from scipy.spatial.distance import euclidean
 
 # ===================== CONFIG =====================
 WINDOW = 15  # frames for motion analysis
-PROXIMITY_THRESHOLD = 150  # pixels for interaction detection
+PROXIMITY_THRESHOLD = 120  # pixels for interaction detection
 STRIKE_ZONE_THRESHOLD = 80  # pixels for strike detection
+MIN_RAPID_FRAMES = 3  # frames within WINDOW
 
 SEVERITY_COLORS = {
     "CRITICAL": (0, 0, 255),      # Red - Active violence
@@ -218,36 +219,43 @@ class RuleEngine:
         seq = self.pose_hist[track_id]
         if len(seq) < 5:
             return None
-        
+
+        STRIKE_VELOCITY_THRESHOLD = 45   # px/frame
+        STRIKE_ACCEL_THRESHOLD = 15     # px/frame²
+
         metrics = {
-            'max_velocity': 0,
-            'acceleration': 0,
-            'rapid_extension': False,
-            'strike_direction': None
+            'max_velocity': 0.0,
+            'acceleration': 0.0,
+            'rapid_extension': False
         }
-        
+
         velocities = []
+
         for i in range(1, min(len(seq), 8)):
             prev_k, prev_c = seq[i - 1]
             curr_k, curr_c = seq[i]
-            
+
             for side in ['left', 'right']:
                 idx = KEYPOINTS[f"{side}_wrist"]
                 prev_w = self.safe_point(prev_k, prev_c, idx)
                 curr_w = self.safe_point(curr_k, curr_c, idx)
-                
+
                 if prev_w is not None and curr_w is not None:
                     vel = euclidean(prev_w, curr_w)
                     velocities.append(vel)
                     metrics['max_velocity'] = max(metrics['max_velocity'], vel)
-        
+
         if len(velocities) >= 3:
-            # Detect rapid acceleration (strike signature)
             accel = np.diff(velocities)
-            metrics['acceleration'] = float(np.max(accel)) if len(accel) > 0 else 0
-            metrics['rapid_extension'] = metrics['max_velocity'] > 25 and metrics['acceleration'] > 8
-        
+            metrics['acceleration'] = float(np.max(accel)) if len(accel) > 0 else 0.0
+
+            metrics['rapid_extension'] = (
+                metrics['max_velocity'] > STRIKE_VELOCITY_THRESHOLD
+                and metrics['acceleration'] > STRIKE_ACCEL_THRESHOLD
+            )
+
         return metrics
+
     
     def analyze_torso_movement(self, track_id):
         """Analyze torso movement for fighting dynamics"""
@@ -385,7 +393,12 @@ class RuleEngine:
                         strike_detected = self.detect_strike_impact(p, inter['person2'])
                     else:
                         strike_detected = self.detect_strike_impact(inter['person1'], p)
-            
+            rapid_count = 0
+            if hand_metrics and hand_metrics['rapid_extension']:
+                self.strike_hist[tid].append(self.frame_count)
+
+            rapid_count = len(self.strike_hist[tid])
+
             # ==================== CLASSIFICATION ====================
             
             action = "Normal Motion"
@@ -452,7 +465,13 @@ class RuleEngine:
                 metrics = {"distance": involved_interaction['distance']}
             
             # MEDIUM: Suspicious behavior
-            elif punch_features and hand_metrics and hand_metrics['rapid_extension']:
+            elif (
+    punch_features
+    and hand_metrics
+    and hand_metrics['rapid_extension']
+    and rapid_count >= MIN_RAPID_FRAMES
+):
+
                 action = "Shadow Boxing / Air Punching"
                 severity = "MEDIUM"
                 rule_name = "RAPID_PUNCH_NO_TARGET"

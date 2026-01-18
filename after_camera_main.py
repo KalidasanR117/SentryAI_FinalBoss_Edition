@@ -301,7 +301,7 @@ def run_live(source):
         print("[CAMERA] Initializing multi-camera rotation...")
         config = CameraConfig(
             base_time_window=10.0,
-            extension_multiplier=2.5,
+            # extension_multiplier=2.5,
             max_scan_index=10
         )
         
