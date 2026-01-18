@@ -898,23 +898,327 @@ def run_offline(video_path):
         print(f"[ERROR] Report generation failed: {e}")
         import traceback
         traceback.print_exc()
+def run_pose_offline(video_path):
+    frame_pose_data = {}
 
+    """Run offline analysis using pose-based rule engine (no transformer)"""
+    print("[MODE] POSE OFFLINE")
+    
+    if not Path(video_path).exists():
+        print(f"[ERROR] Video file not found: {video_path}")
+        return
+    
+    try:
+        validate_paths()
+    except FileNotFoundError as e:
+        print(f"[ERROR] {e}")
+        return
+
+    # ===================== LOAD VIDEO =====================
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open video: {video_path}")
+        return
+    
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[INFO] Video: {total_frames} frames @ {fps:.2f} FPS")
+
+    # ===================== LOAD MODELS =====================
+    try:
+        scrfd = SCRFD(model_path=str(SCRFD_MODEL))
+        arcface = ort.InferenceSession(
+            str(ARCFACE_MODEL),
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+        face_db = load_or_build_face_db(scrfd, arcface, str(FACE_GALLERY))
+        
+        detector = Detector()
+        pose_buffer = PoseBuffer(max_len=30)
+        rule_engine = RuleEngine(history=30)
+        
+    except Exception as e:
+        print(f"[ERROR] Model initialization failed: {e}")
+        return
+
+    # ===================== PROCESS VIDEO =====================
+    print("[INFO] Processing video with pose detection...")
+    
+    frames = []
+    all_events = []
+    cache = {}
+    next_face_id = 0
+    frame_face_data = {}
+    frame_idx = 0
+    
+    event_mgr = EventManager(fps=fps, source="POSE_OFFLINE")
+    frame_store = {}
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frames.append(frame.copy())
+        
+        # Store frames at 1 second intervals
+        if frame_idx % int(fps) == 0:
+            frame_store[frame_idx] = frame.copy()
+        
+        # Pose detection
+        persons, objects = detector.infer(frame)
+        frame_pose_data[frame_idx] = persons
+
+        # Update pose buffer
+        for p in persons:
+            pose_buffer.update(p["track_id"], p["keypoints"])
+        
+        # Rule engine
+        rule_results = rule_engine.update(persons, objects)
+        
+        # Face recognition
+        _, cache, next_face_id, face_results = process_face_recognition(
+            frame, scrfd, arcface, face_db, cache, next_face_id
+        )
+        
+        frame_face_data[frame_idx] = face_results
+        track_to_face = match_faces_to_poses(persons, face_results)
+        
+        # Check for blacklisted faces
+        blacklisted_in_frame = [
+            info['name'] for tid, info in track_to_face.items() 
+            if info.get('status') == 'blacklist'
+        ]
+        
+        if blacklisted_in_frame:
+            screenshot_path = OFFLINE_SCREENSHOT_DIR / f"blacklist_{frame_idx}.jpg"
+            cv2.imwrite(str(screenshot_path), frame)
+            
+            event_mgr.update(
+                frame_idx=frame_idx,
+                label="Blacklisted Person Detected",
+                severity="CRITICAL",
+                confidence=1.0,
+                face_ids=blacklisted_in_frame,
+                override="BLACKLIST",
+                cause={
+                    "trigger": "FACE_RECOGNITION",
+                    "rule_name": "BLACKLIST_MATCH",
+                    "description": "Known blacklisted individual detected",
+                    "joints_involved": [],
+                    "metrics": {"faces": blacklisted_in_frame}
+                },
+                screenshot=str(screenshot_path)
+            )
+        
+        # Process rule violations
+        active_event_this_frame = False
+        
+        for p in persons:
+            tid = p["track_id"]
+            
+            if tid in rule_results:
+                result = rule_results[tid].copy()
+                face_info = track_to_face.get(tid)
+                
+                # Apply whitelist/blacklist logic
+                if face_info and face_info.get('status') == 'whitelist':
+                    if 'cause' not in result:
+                        result['cause'] = {}
+                    if 'metrics' not in result['cause']:
+                        result['cause']['metrics'] = {}
+                    
+                    result['cause']['metrics']['whitelisted_person'] = face_info['name']
+                    result['cause']['whitelist_note'] = f"Whitelisted person '{face_info['name']}' involved"
+                    
+                    if result['severity'] == 'MEDIUM':
+                        original_action = result['action']
+                        result['action'] = f"{original_action} (Whitelisted - Low Priority)"
+                        result['severity'] = 'LOW'
+                        result['color'] = SEVERITY_COLORS['LOW']
+                
+                elif face_info and face_info.get('status') == 'blacklist':
+                    if 'cause' not in result:
+                        result['cause'] = {}
+                    if 'metrics' not in result['cause']:
+                        result['cause']['metrics'] = {}
+                    
+                    result['cause']['metrics']['blacklisted_person'] = face_info['name']
+                    result['cause']['blacklist_note'] = f"ALERT: Blacklisted person '{face_info['name']}' involved"
+                    
+                    if result['severity'] != 'CRITICAL':
+                        result['severity'] = 'CRITICAL'
+                        result['color'] = SEVERITY_COLORS['CRITICAL']
+                
+                active_event_this_frame = True
+                
+                screenshot_path = None
+                if (
+                    event_mgr.current_event is None or
+                    event_mgr.current_event["type"] != result["action"]
+                ):
+                    screenshot_path = OFFLINE_SCREENSHOT_DIR / f"event_{frame_idx}_track_{tid}.jpg"
+                    cv2.imwrite(str(screenshot_path), frame)
+                
+                event_mgr.update(
+                    frame_idx=frame_idx,
+                    label=result["action"],
+                    severity=result["severity"],
+                    confidence=None,
+                    face_ids=[tid],
+                    override=None,
+                    cause=result.get("cause"),
+                    screenshot=str(screenshot_path) if screenshot_path else None
+                )
+        
+        if not active_event_this_frame and not blacklisted_in_frame:
+            event_mgr.update(
+                frame_idx=frame_idx,
+                label="Normal",
+                severity="LOW"
+            )
+        
+        # Progress indicator
+        if frame_idx % 100 == 0:
+            progress = (frame_idx / total_frames) * 100
+            print(f"  Progress: {progress:.1f}%", end='\r')
+        
+        frame_idx += 1
+    
+    cap.release()
+    print(f"\n[INFO] Processed {frame_idx} frames")
+    
+    # Finalize events
+    event_mgr.finalize()
+    events = event_mgr.export()
+    
+    # ===================== REPLAY =====================
+    print("[INFO] Replaying results...")
+    replay_pose_offline(frames, events, frame_pose_data, fps)
+
+    
+    # ===================== GENERATE REPORT =====================
+    try:
+        from reports.event_adapter import adapt_events_for_pdf
+        from reports.pdf_report import generate_pdf_report
+        from llm.summary_generator import generate_llm_summary
+        from datetime import datetime
+        
+        event_buffer = adapt_events_for_pdf(events, frame_store)
+        summary_text = generate_llm_summary(events=event_buffer, mode="POSE_OFFLINE")
+        
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_pdf = OFFLINE_REPORT_DIR / f"sentry_pose_offline_report_{ts}.pdf"
+        
+        generate_pdf_report(event_buffer, summary_text, str(output_pdf))
+        print(f"\n[POSE OFFLINE REPORT] Generated → {output_pdf}")
+        
+    except Exception as e:
+        print(f"[ERROR] Report generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def replay_pose_offline(frames, events, frame_pose_data, fps):
+
+    """Replay pose offline inference results"""
+    delay = max(1, int(1000 / fps))
+    frame_track_severity = {}
+
+    # Build frame-to-event mapping
+    frame_events = {}
+    for event in events:
+        start_frame = int(event["start_time"] * fps)
+        end_frame = int(event["end_time"] * fps)
+        severity = event.get("final", "safe")  # danger / warning / safe
+
+        
+        for f_idx in range(start_frame, end_frame + 1):
+            if f_idx not in frame_events:
+                frame_events[f_idx] = []
+            frame_events[f_idx].append(event)
+    
+    for idx, frame in enumerate(frames):
+        display_frame = frame.copy()
+        
+        # Draw events for this frame
+        if idx in frame_events:
+            y_offset = 40
+            for event in frame_events[idx]:
+                label = event['type']
+                severity = event.get("severity", "").upper()
+                final = event.get("final", "").lower()
+
+                if severity == "CRITICAL":
+                    color = (0, 0, 255)      # 🔴 Danger
+                elif severity in ["HIGH", "MEDIUM"]:
+                    color = (0, 255, 255)    # 🟡 Suspicious
+                elif final == "danger":
+                    color = (0, 0, 255)
+                elif final == "warning":
+                    color = (0, 255, 255)
+                else:
+                    color = (0, 255, 0)      # 🟢 Normal
+
+                                
+                
+                cv2.putText(
+                    display_frame,
+                    label,
+                    (20, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    color,
+                    2
+                )
+                y_offset += 30
+        if idx in frame_pose_data:
+            display_frame = draw_pose(
+                display_frame,
+                [{
+                    "keypoints": p["keypoints"],
+                    "confidence": np.ones(len(p["keypoints"])),
+                    "track_id": p["track_id"]
+                } for p in frame_pose_data[idx]]
+            )
+
+        cv2.imshow("POSE OFFLINE REPLAY", display_frame)
+        if cv2.waitKey(delay) & 0xFF == ord("q"):
+            break
+    
+    cv2.destroyAllWindows()
 
 # ========================= ENTRY POINT =========================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sentry Violence Detection System")
+
     parser.add_argument(
         "--source",
         default="0",
         help="Video source: '0' for webcam or path to video file"
     )
+
+    parser.add_argument(
+        "--pose",
+        action="store_true",
+        help="Use pose-based offline inference instead of transformer"
+    )
+
     args = parser.parse_args()
 
     try:
+        # LIVE MODE
         if args.source == "0":
             run_live(0)
+
+        # POSE OFFLINE MODE
+        elif args.pose:
+            run_pose_offline(args.source)
+
+        # TRANSFORMER OFFLINE MODE (default)
         else:
             run_offline(args.source)
+
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user")
     except Exception as e:
