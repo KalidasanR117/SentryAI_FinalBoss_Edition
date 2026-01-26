@@ -3,4 +3,5 @@
 !.gitattributes
 *.jpg
 *.pdf
+*.json
 alerts\firebase_key.json
