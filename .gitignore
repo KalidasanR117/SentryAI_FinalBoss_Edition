@@ -3,5 +3,4 @@
 !.gitattributes
 *.jpg
 *.pdf
-alerts\notifier.py
 alerts\firebase_key.json
