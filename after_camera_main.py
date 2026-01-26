@@ -15,6 +15,8 @@ import onnxruntime as ort
 from pathlib import Path
 from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
 from torch.nn.functional import cosine_similarity
+from alerts.notifier import send_critical_alert
+
 
 # ========================= LIVE PIPELINE IMPORTS =========================
 from core.detector import Detector
@@ -284,6 +286,8 @@ def load_or_build_dance_embeddings(dance_dir, extract_embedding, device):
 
 # ========================= LIVE MODE =========================
 def run_live(source):
+    alert_sent_for_event = False
+
     """Run live detection mode with camera rotation support"""
     print("[MODE] LIVE")
     
@@ -422,6 +426,20 @@ def run_live(source):
                 )
 
             active_event_this_frame = False
+            if blacklisted_in_frame and not alert_sent_for_event:
+                send_critical_alert(
+                    event={
+                        "type": "Blacklisted Person Detected",
+                        "severity": "CRITICAL",
+                        "confidence": 1.0,
+                        "cause": {
+                            "description": "Known blacklisted individual detected"
+                        }
+                    },
+                    report_path=None,
+                    mode="LIVE"
+                )
+                alert_sent_for_event = True
 
             for p in persons:
                 tid = p["track_id"]
@@ -429,17 +447,13 @@ def run_live(source):
                 if tid in rule_results:
                     result = rule_results[tid].copy()
                     
-                    # NEW: Update severity for scheduler
-                    # result_severity = map_severity_to_enum(result['severity'])
-                    # if result_severity.value > current_severity.value:
-                    #     current_severity = result_severity
                     result_severity = map_severity_to_enum(result['severity'])
                     if SEVERITY_RANK[result_severity] > SEVERITY_RANK[current_severity]:
                         current_severity = result_severity
 
                     face_info = track_to_face.get(tid)
                     
-                    # Whitelist/blacklist logic (unchanged)
+                    
                     if face_info and face_info.get('status') == 'whitelist':
                         if 'cause' not in result:
                             result['cause'] = {}
@@ -473,7 +487,19 @@ def run_live(source):
                             result['color'] = SEVERITY_COLORS['CRITICAL']
                     
                     active_event_this_frame = True
-
+                    if result["severity"] == "CRITICAL" and not alert_sent_for_event:
+                        send_critical_alert(
+                            event={
+                                "type": result["action"],
+                                "severity": result["severity"],
+                                "confidence": result.get("confidence"),
+                                "cause": result.get("cause"),
+                            },
+                            report_path=None,   # 🔥 NO REPORT (as you decided)
+                            mode="LIVE"
+                        )
+                        alert_sent_for_event = True
+                    
                     screenshot_path = None
                     if (
                         event_mgr.current_event is None or
@@ -510,6 +536,7 @@ def run_live(source):
                     label="Normal",
                     severity="LOW"
                 )
+                alert_sent_for_event = False
 
             # NEW: Update camera scheduler and display info
             if use_rotation:
@@ -592,7 +619,8 @@ def run_live(source):
 
         generate_pdf_report(event_buffer, summary_text, str(output_path))
         print(f"\n[REPORT] Generated → {output_path}")
-        
+       
+
     except Exception as e:
         print(f"[ERROR] Report generation failed: {e}")
 
@@ -756,8 +784,10 @@ def run_offline(video_path):
             # Folder-based dance detection (intentional)
             if is_dance_video:
                 # Dance videos: normal unless violence-like motion is detected
-                if fight_score > LOW_VIOLENCE:
-                    labels[j] = "Dance"
+                if fight_score > HIGH_VIOLENCE:
+                    labels[j] = "Normal"
+                elif fight_score > LOW_VIOLENCE:
+                    labels[j] = "Fight (Low Confidence)"
                 else:
                     labels[j] = "Normal"
             else:
@@ -893,7 +923,18 @@ def run_offline(video_path):
 
         generate_pdf_report(events, summary_text, str(output_pdf))
         print(f"\n[OFFLINE REPORT] Generated → {output_pdf}")
-        
+        critical_events = [
+            e for e in events
+            if e.get("final") == "danger"
+        ]
+
+        if critical_events:
+            send_critical_alert(
+                event=critical_events[0],
+                report_path=str(output_pdf),
+                mode="OFFLINE"
+            )
+            
     except Exception as e:
         print(f"[ERROR] Report generation failed: {e}")
         import traceback
@@ -1112,7 +1153,19 @@ def run_pose_offline(video_path):
         
         generate_pdf_report(event_buffer, summary_text, str(output_pdf))
         print(f"\n[POSE OFFLINE REPORT] Generated → {output_pdf}")
-        
+        critical_events = [
+            e for e in events
+            if e.get("severity") == "CRITICAL" or e.get("final") == "danger"
+        ]
+
+        if critical_events:
+            send_critical_alert(
+                event=critical_events[0],
+                report_path=str(output_pdf),
+                mode="POSE"
+            )
+
+
     except Exception as e:
         print(f"[ERROR] Report generation failed: {e}")
         import traceback
