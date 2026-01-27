@@ -136,6 +136,12 @@ class CameraManager:
         self.failed_cameras = set()
         self.current_index = 0
         self.active_camera: Optional[cv2.VideoCapture] = None
+        self.stopped = False
+    def stop(self):
+        self.stopped = True
+        self.scheduler.reset_window()
+        self.stop_camera()
+        print("[CAMERA MANAGER] Fully stopped")
 
     def initialize(self) -> bool:
         self.camera_indices = self.discovery.scan_cameras()
@@ -147,6 +153,8 @@ class CameraManager:
         return True
 
     def start_camera(self) -> bool:
+        self.stopped = False
+
         if not self.camera_indices:
             return False
 
@@ -186,6 +194,9 @@ class CameraManager:
             self.active_camera = None
 
     def rotate_camera(self) -> bool:
+        if self.stopped:
+            return False
+
         print("[CAMERA MANAGER] Rotating camera...")
         self.stop_camera()
 
@@ -199,6 +210,7 @@ class CameraManager:
         print("[CAMERA MANAGER] ERROR: No usable cameras remaining")
         return False
 
+
     def read_frame(self) -> Tuple[bool, Optional[any]]:
         if not self.active_camera:
             return False, None
@@ -208,10 +220,14 @@ class CameraManager:
         self.scheduler.update_event(severity)
 
     def should_rotate(self) -> bool:
+        if self.stopped:
+            return False
+
         return (
             len(self.camera_indices) > 1
             and self.scheduler.should_rotate()
         )
+
 
     def get_status(self) -> dict:
         return {
