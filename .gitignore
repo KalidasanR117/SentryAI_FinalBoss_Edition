@@ -4,4 +4,5 @@
 *.jpg
 *.pdf
 *.json
+*.mp4
 alerts\firebase_key.json
