@@ -86,7 +86,26 @@ class RuleEngine:
             if pt is not None:
                 pts.append(pt)
         return np.mean(pts, axis=0) if pts else None
-    
+    def analyze_leg_velocity(self, track_id):
+        seq = self.pose_hist[track_id]
+        if len(seq) < 5:
+            return 0.0
+
+        velocities = []
+
+        for i in range(1, min(len(seq), 6)):
+            prev_k, prev_c = seq[i - 1]
+            curr_k, curr_c = seq[i]
+
+            for side in ["left", "right"]:
+                idx = KEYPOINTS[f"{side}_ankle"]
+                p1 = self.safe_point(prev_k, prev_c, idx)
+                p2 = self.safe_point(curr_k, curr_c, idx)
+                if p1 is not None and p2 is not None:
+                    velocities.append(euclidean(p1, p2))
+
+        return max(velocities) if velocities else 0.0
+
     # ==================== BIOMECHANICAL ANALYSIS ====================
     
     def detect_punch_posture(self, kps, conf):
@@ -338,6 +357,7 @@ class RuleEngine:
         results = {}
         self.frame_count += 1
         
+
         # Update pose history
         for p in persons:
             tid = p["track_id"]
@@ -351,6 +371,7 @@ class RuleEngine:
             tid = p["track_id"]
             kps = p["keypoints"]
             conf = p["confidence"]
+            leg_velocity = self.analyze_leg_velocity(tid)
             
             # Skip if insufficient history
             if len(self.pose_hist[tid]) < 5:
@@ -374,6 +395,8 @@ class RuleEngine:
             # Analyze postures and movements
             punch_features = self.detect_punch_posture(kps, conf)
             kick_features = self.detect_kicking_posture(kps, conf)
+
+            
             blocking = self.detect_blocking_posture(kps, conf)
             aggressive_stance = self.detect_aggressive_stance(kps, conf)
             
@@ -393,6 +416,18 @@ class RuleEngine:
                         strike_detected = self.detect_strike_impact(p, inter['person2'])
                     else:
                         strike_detected = self.detect_strike_impact(inter['person1'], p)
+            # 🔒 Directional + target sanity check (ANTI-WALKING FILTER)
+            if kick_features and involved_interaction:
+                ankle = self.safe_point(kps, conf, KEYPOINTS["right_ankle"])
+                torso_other = self.get_torso_center(
+                    involved_interaction["person2"]["keypoints"],
+                    involved_interaction["person2"]["confidence"]
+                )
+
+                if ankle is not None and torso_other is not None:
+                    if euclidean(ankle, torso_other) > 120:
+                        kick_features = []  # invalidate fake kicks
+
             rapid_count = 0
             if hand_metrics and hand_metrics['rapid_extension']:
                 self.strike_hist[tid].append(self.frame_count)
@@ -423,7 +458,7 @@ class RuleEngine:
                 # Record strike with timestamp
                 self.strike_hist[tid].append(self.frame_count)
             
-            elif kick_features and involved_interaction and involved_interaction['distance'] < 120:
+            elif kick_features and involved_interaction and involved_interaction['distance'] < 100 and leg_velocity > 35:
                 action = "Kicking Attack"
                 severity = "CRITICAL"
                 rule_name = "KICK_IN_PROXIMITY"
@@ -498,6 +533,9 @@ class RuleEngine:
                 joints = ["shoulder", "hip", "torso"]
                 metrics = {"torso_speed_std": torso_metrics['erratic']}
             
+            
+
+
             # Build result
             payload = {
                 "action": action,

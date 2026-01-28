@@ -28,6 +28,10 @@ from core.camera_manager import CameraManager, CameraConfig, EventSeverity, map_
 from pose_face_main import load_or_build_face_db, process_face_recognition
 
 # ========================= CONFIG & GLOBALS =========================
+# 🔥 DISPLAY RESOLUTION (not inference resolution)
+DISPLAY_WIDTH = 640
+DISPLAY_HEIGHT = 480
+
 SEVERITY_RANK = {
     EventSeverity.NORMAL: 0, EventSeverity.LOW: 1,
     EventSeverity.MEDIUM: 2, EventSeverity.HIGH: 3, EventSeverity.CRITICAL: 4,
@@ -35,6 +39,7 @@ SEVERITY_RANK = {
 
 API_MODE = True
 STREAM_FRAME = None
+CURRENT_FPS = 0  # 🔥 NEW: Global FPS counter for API
 import threading
 STREAM_LOCK = threading.Lock()
 API_ONLY = True
@@ -134,7 +139,6 @@ def match_faces_to_poses(persons, face_results, iou_threshold=0.3):
             }
     return track_to_face
 
-# 🔥 NEW HELPER: Letterboxing (Fit video to box with black bars)
 def resize_with_padding(image, target_size=(640, 480)):
     h, w = image.shape[:2]
     th, tw = target_size
@@ -143,15 +147,14 @@ def resize_with_padding(image, target_size=(640, 480)):
     nw, nh = int(w * scale), int(h * scale)
     resized = cv2.resize(image, (nw, nh))
     
-    # Create black canvas
     canvas = np.zeros((th, tw, 3), dtype=np.uint8)
     
-    # Center image
     x_off = (tw - nw) // 2
     y_off = (th - nh) // 2
     canvas[y_off:y_off+nh, x_off:x_off+nw] = resized
     
     return canvas, scale, x_off, y_off
+
 def send_offline_summary_alert(events, mode):
     if not events:
         return
@@ -170,7 +173,6 @@ def send_offline_summary_alert(events, mode):
         elif severity == "HIGH" and highest_severity != "CRITICAL":
             highest_severity = "HIGH"
 
-    # Build summary text
     lines = [f"{k} × {v}" for k, v in summary.items()]
     summary_text = " | ".join(lines)
 
@@ -192,7 +194,6 @@ def send_offline_summary_alert(events, mode):
 def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE"):
     global RUN_LIVE, STOP_LIVE
 
-    # Ensure flags are set so the loop starts
     RUN_LIVE = True
     STOP_LIVE = False
 
@@ -202,7 +203,6 @@ def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE
         print("[REPLAY] Failed to open video")
         return
 
-    # 1. Calculate Scaling Factors
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -210,7 +210,6 @@ def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE
     scale_x = target_w / orig_w
     scale_y = target_h / orig_h
 
-    # 2. Build Event Lookup (Optimization)
     frame_events = {}
     for e in events:
         start_f = int(e["start_time"] * fps)
@@ -230,7 +229,6 @@ def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE
 
         ret, frame = cap.read()
         
-        # Loop Video
         if not ret:
             if STOP_LIVE:
                 break
@@ -238,40 +236,33 @@ def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             continue
 
-
-        # Force Resize to fit Camera Box
         display_frame = cv2.resize(frame, (target_w, target_h))
 
-        # ===================== POSE MODE SPECIFIC =====================
         if mode == "POSE" and frame_idx in frame_data_map:
             persons, rule_results = frame_data_map[frame_idx]
             scaled_persons = []
 
             for p in persons:
-                # Deep copy and scale keypoints
                 kp = p["keypoints"].copy()
                 kp[:, 0] *= scale_x
                 kp[:, 1] *= scale_y
 
-                # Determine Action Label
                 action = "Normal"
-                label_color = (0, 255, 0) # Green
+                label_color = (0, 255, 0)
 
                 if p["track_id"] in rule_results:
                     r = rule_results[p["track_id"]]
                     action = r["action"]
                     if r["severity"] == "CRITICAL":
-                        label_color = (0, 0, 255) # Red
+                        label_color = (0, 0, 255)
                     elif r["severity"] == "HIGH":
-                        label_color = (0, 165, 255) # Orange
+                        label_color = (0, 165, 255)
 
-                # Draw Label above head
                 if len(kp) > 0:
                     head_x = int(kp[0][0])
                     head_y = int(kp[0][1]) - 15
                     if head_y < 20: head_y = 20
                     
-                    # Outline + Text
                     cv2.putText(display_frame, action, (head_x, head_y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
                     cv2.putText(display_frame, action, (head_x, head_y),
@@ -285,86 +276,59 @@ def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE
 
             display_frame = draw_pose(display_frame, scaled_persons)
 
-        # ===================== SHARED STATUS BAR (BOTTOM) =====================
-        # Defaults
         main_label = "Normal"
         main_score = 0.0
-        bar_color = (0, 255, 0) # Green
+        bar_color = (0, 255, 0)
         is_alert = False
 
-        # 1. Check Transformer Data
         if mode == "TRANSFORMER" and frame_idx in frame_data_map:
             lbl, scr, _ = frame_data_map[frame_idx]
             main_label = lbl
             main_score = scr
             
             if "Fight" in lbl: 
-                bar_color = (0, 0, 255) # Red
+                bar_color = (0, 0, 255)
                 is_alert = True
             elif "Dance" in lbl: 
-                bar_color = (255, 255, 0) # Cyan
+                bar_color = (255, 255, 0)
                 is_alert = True
             elif "Suspicious" in lbl: 
-                bar_color = (0, 165, 255) # Orange
+                bar_color = (0, 165, 255)
                 is_alert = True
 
-        # 2. Check Event Timeline (Overrides Transformer)
         if frame_idx in frame_events:
-            e = frame_events[frame_idx][0] # Take first event
+            e = frame_events[frame_idx][0]
             main_label = e["type"]
             is_alert = True
             if e.get("final") == "danger":
-                bar_color = (0, 0, 255) # Red
+                bar_color = (0, 0, 255)
             else:
-                bar_color = (0, 255, 255) # Yellow/Cyan
+                bar_color = (0, 255, 255)
 
-        # Draw the Bar
         status_text = f"ALERT: {main_label}" if is_alert else f"STATUS: {main_label}"
         if main_score > 0: status_text += f" ({main_score:.2f})"
 
-        # ===================== SAFE STATUS BAR (BOTTOM) =====================
         h, w = display_frame.shape[:2]
-
         BAR_HEIGHT = 40
-        BAR_MARGIN = 80   # <-- move bar UP safely (this is the key)
+        BAR_MARGIN = 80
 
         bar_top = h - BAR_MARGIN - BAR_HEIGHT
         bar_bottom = h - BAR_MARGIN
 
-        # Draw background
-        cv2.rectangle(
-            display_frame,
-            (0, bar_top),
-            (w, bar_bottom),
-            (0, 0, 0),
-            -1
-        )
+        cv2.rectangle(display_frame, (0, bar_top), (w, bar_bottom), (0, 0, 0), -1)
+        cv2.putText(display_frame, status_text, (20, bar_bottom - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, bar_color, 2)
 
-        # Draw text
-        cv2.putText(
-            display_frame,
-            status_text,
-            (20, bar_bottom - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            bar_color,
-            2
-        )
-
-
-
-        # ===================== STREAM =====================
         push_frame(display_frame)
         frame_idx += 1
 
-        # FPS Pacing
         process_time = time.time() - start_time
         sleep_time = delay - process_time
         if sleep_time > 0:
             time.sleep(sleep_time)
 
     cap.release()
-    RUN_LIVE = False # Reset flag when stopped
+    RUN_LIVE = False
     print("[REPLAY] Stopped.")
 
 # ========================= OFFLINE POSE (NO FACE REC) =========================
@@ -373,7 +337,6 @@ def run_pose_offline(video_path):
     if not Path(video_path).exists(): return
 
     try:
-        # NOTE: Only loading Detector & Rule Engine. NO FACE MODELS.
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -395,19 +358,16 @@ def run_pose_offline(video_path):
         
         if frame_idx % int(fps) == 0: frame_store[frame_idx] = frame.copy()
 
-        # Inference
         persons, objects = detector.infer(frame)
         for p in persons: pose_buffer.update(p["track_id"], p["keypoints"])
         rule_results = rule_engine.update(persons, objects)
         
-        # Save results for replay
         frame_data_map[frame_idx] = (persons, rule_results)
 
         active = False
         for p in persons:
             if p["track_id"] in rule_results:
                 res = rule_results[p["track_id"]]
-                # Log severe events
                 if res["severity"] != "NORMAL":
                     event_mgr.update(frame_idx=frame_idx, label=res["action"], severity=res["severity"], face_ids=[p["track_id"]])
                     active = True
@@ -422,7 +382,6 @@ def run_pose_offline(video_path):
     event_mgr.finalize()
     events = event_mgr.export()
     
-    # Reports
     try:
         from reports.event_adapter import adapt_events_for_pdf
         from reports.pdf_report import generate_pdf_report
@@ -436,13 +395,13 @@ def run_pose_offline(video_path):
 
     stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE")
     send_offline_summary_alert(events, mode="OFFLINE")
+
 # ========================= OFFLINE TRANSFORMER (NO FACE REC) =========================
 def run_offline(video_path):
     print("[MODE] TRANSFORMER OFFLINE (Face Rec: OFF)")
     if not Path(video_path).exists(): return
 
     try:
-        # NOTE: Only loading VideoMAE. NO FACE MODELS.
         device = "cuda" if torch.cuda.is_available() else "cpu"
         processor = VideoMAEImageProcessor.from_pretrained(VIDEOMAE_MODEL)
         model = VideoMAEForVideoClassification.from_pretrained(VIDEOMAE_MODEL).to(device).eval()
@@ -460,15 +419,12 @@ def run_offline(video_path):
     cap.release()
     total_frames = len(frames)
 
-    # Dance Logic
     is_dance_video = False
     try:
         if "dance" in Path(video_path).name.lower() or "dance" in str(Path(video_path).parent).lower():
             is_dance_video = True
-            print(f"[INFO] 💃 Dance Mode ACTIVATED")
     except: pass
 
-    # Initialize all as Normal
     labels = ["Normal"] * total_frames
     scores = np.zeros(total_frames)
     frame_store = {}
@@ -497,20 +453,16 @@ def run_offline(video_path):
                     labels[j] = "Fight"
                 else:
                     labels[j] = "Normal"
-
         
         if i % 100 == 0: print(f"   MAE Progress: {int(i/total_frames*100)}%", end='\r')
 
-    # Prepare Replay Data
     frame_data_map = {}
     for i in range(total_frames):
-        # Empty list for blacklist, Face Rec is OFF
         frame_data_map[i] = (labels[i], scores[i], [])
 
-    # Build Events & Sync
     from events.offline_event_builder import build_offline_events
     events = build_offline_events(frames, labels, scores, fps, str(OFFLINE_SCREENSHOT_DIR))
-    # 🔥 FIX: Ensure severity exists for all transformer events
+    
     for e in events:
         if "severity" not in e:
             if "Fight" in e["type"]:
@@ -529,7 +481,6 @@ def run_offline(video_path):
             cause=e.get("cause")
         )
 
-    # Report
     try:
         from reports.event_adapter import adapt_events_for_pdf
         from reports.pdf_report import generate_pdf_report
@@ -542,18 +493,16 @@ def run_offline(video_path):
     except Exception as e:
         print("[OFFLINE TRANSFORMER REPORT ERROR]", e)
 
-
     stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="TRANSFORMER")
     send_offline_summary_alert(events, mode="OFFLINE")
-# ========================= LIVE MODE =========================
+
+# ========================= 🔥 FIXED LIVE MODE (SAME LOGIC AS OFFLINE) =========================
 def run_live(source):
     global RUN_LIVE, PAUSE_LIVE, STOP_LIVE
     RUN_LIVE = True
     PAUSE_LIVE = False
-    # STOP_LIVE = False
     alert_sent_for_event = False
 
-    """Run live detection mode with camera rotation support"""
     print("[MODE] LIVE")
     print("CUDA available:", torch.cuda.is_available())
     print("CUDA device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
@@ -566,7 +515,6 @@ def run_live(source):
 
     # ===================== CAMERA SETUP =====================
     camera_mgr = None
-    # Handle "0" string or int 0
     use_rotation = (str(source) == "0" or source == 0) and (source != "1") 
     
     if use_rotation:
@@ -591,7 +539,6 @@ def run_live(source):
         global ACTIVE_CAMERA_MGR
         ACTIVE_CAMERA_MGR = camera_mgr
 
-
     if not use_rotation:
         cap = cv2.VideoCapture(source)
         if not cap.isOpened():
@@ -601,16 +548,7 @@ def run_live(source):
 
     # ===================== INIT MODELS =====================
     try:
-        scrfd = SCRFD(
-            model_path=str(SCRFD_MODEL)
-        )
-
-        
-        # 🔥 DEBUG: CHECK ONNX DEVICE
-        import onnxruntime
-        print(f"ONNX Runtime Device: {onnxruntime.get_device()}")
-        
-        
+        scrfd = SCRFD(model_path=str(SCRFD_MODEL))
         arcface = create_onnx_session(ARCFACE_MODEL)
         face_db = load_or_build_face_db(scrfd, arcface, str(FACE_GALLERY))
         
@@ -629,12 +567,15 @@ def run_live(source):
     next_face_id = 0
     frame_store = {}
     
-    # 🔥 OPTIMIZATION STATE
     last_face_results = {}
+    
+    # 🔥 Store original frame dimensions for scaling
+    orig_width = None
+    orig_height = None
 
     # ===================== MAIN LOOP =====================
     try:
-        while RUN_LIVE  and not STOP_LIVE:
+        while RUN_LIVE and not STOP_LIVE:
             if STOP_LIVE:
                 print("[LIVE] Stop requested → breaking loop")
                 break
@@ -643,7 +584,7 @@ def run_live(source):
                 time.sleep(0.05)
                 continue
 
-            # MODIFIED: Read frame with rotation support
+            # Read frame at ORIGINAL resolution
             if use_rotation:
                 ret, frame = camera_mgr.read_frame()
                 if not ret:
@@ -658,23 +599,15 @@ def run_live(source):
                 if not ret:
                     break
 
-            # 🔥 OPTIMIZATION 1: RESIZE INPUT
-            # Resize large frames (e.g., 1080p) to 640px width.
-            # This drastically reduces CPU load for Face Rec and WebRTC encoding.
-            height, width = frame.shape[:2]
-            if width > 640:
-                scale = 640 / width
-                new_height = int(height * scale)
-                frame = cv2.resize(frame, (640, new_height))
-
-            if frame_idx % 30 == 0:
-                 # Debug print to ensure resizing is working
-                 print(f"✅ [DEBUG] Processing Frame {frame_idx} | Shape: {frame.shape}")     
+            # 🔥 CRITICAL: Get original dimensions on first frame
+            if orig_width is None:
+                orig_height, orig_width = frame.shape[:2]
+                print(f"[LIVE] Original: {orig_width}x{orig_height}, Display: {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}")
 
             if frame_idx % int(fps) == 0:
                 frame_store[frame_idx] = frame.copy()
 
-            # 1. POSE DETECTION
+            # 1. POSE DETECTION at ORIGINAL resolution (no resize!)
             persons, objects = detector.infer(frame)
 
             for p in persons:
@@ -683,38 +616,73 @@ def run_live(source):
             # 2. RULE ENGINE
             rule_results = rule_engine.update(persons, objects)
 
-            # 3. 🔥 OPTIMIZATION 2: THROTTLE FACE RECOGNITION
-            # Run Face Rec only every 5 frames. Reuse results in between.
+            # 3. FACE RECOGNITION (every 5 frames)
             if frame_idx % 5 == 0:
                 frame, cache, next_face_id, face_results = process_face_recognition(
                     frame, scrfd, arcface, face_db, cache, next_face_id
                 )
-                last_face_results = face_results # Save for next frames
+                last_face_results = face_results
             else:
-                face_results = last_face_results # Reuse cached results
+                face_results = last_face_results
             
             track_to_face = match_faces_to_poses(persons, face_results)
 
-            frame_out = draw_pose(
-                frame.copy(),
-                [{
-                    "keypoints": p["keypoints"],
-                    "confidence": np.ones(len(p["keypoints"])),
-                    "track_id": p["track_id"]
-                } for p in persons]
-            )
+            # 4. 🔥 LETTERBOX FRAME FOR DISPLAY (maintain aspect ratio with black bars)
+            # Calculate scale to fit in display box
+            scale = min(DISPLAY_WIDTH / orig_width, DISPLAY_HEIGHT / orig_height)
+            new_width = int(orig_width * scale)
+            new_height = int(orig_height * scale)
+            
+            # Resize frame
+            display_frame = cv2.resize(frame, (new_width, new_height))
+            
+            # Create black canvas and center the frame
+            canvas = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+            x_offset = (DISPLAY_WIDTH - new_width) // 2
+            y_offset = (DISPLAY_HEIGHT - new_height) // 2
+            canvas[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = display_frame
+            display_frame = canvas
+            
+            # Update scale factors for keypoints (accounting for offset)
+            scale_x = scale
+            scale_y = scale
 
-            # NEW: Track severity for camera scheduler
+            # 5. 🔥 SCALE KEYPOINTS TO MATCH DISPLAY (accounting for letterbox offset)
+            scaled_persons = []
+            for p in persons:
+                kp = p["keypoints"].copy()
+                kp[:, 0] = kp[:, 0] * scale_x + x_offset  # Scale X + offset
+                kp[:, 1] = kp[:, 1] * scale_y + y_offset  # Scale Y + offset
+                
+                scaled_persons.append({
+                    "keypoints": kp,
+                    "confidence": np.ones(len(kp)),
+                    "track_id": p["track_id"]
+                })
+
+            # 6. DRAW POSES on scaled frame
+            frame_out = draw_pose(display_frame, scaled_persons)
+            
+            # 🔥 SAFETY: Ensure frame_out has correct dimensions
+            out_h, out_w = frame_out.shape[:2]
+            if out_w != DISPLAY_WIDTH or out_h != DISPLAY_HEIGHT:
+                print(f"[WARNING] Frame size mismatch! Expected {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}, got {out_w}x{out_h}")
+                frame_out = cv2.resize(frame_out, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+            
+            # Debug: Show frame dimensions periodically
+            if frame_idx % 60 == 0:
+                print(f"[DEBUG] Frame: {new_width}x{new_height}, Offset: ({x_offset}, {y_offset}), Scale: {scale:.3f}")
+
+            # 7. EVENT TRACKING
             current_severity = EventSeverity.NORMAL
             
-            # Blacklist detection (unchanged)
             blacklisted_in_frame = [
                 info['name'] for tid, info in track_to_face.items() 
                 if info.get('status') == 'blacklist'
             ]
             
             if blacklisted_in_frame:
-                current_severity = EventSeverity.CRITICAL  # NEW
+                current_severity = EventSeverity.CRITICAL
                 
                 screenshot_path = SCREENSHOT_DIR / f"blacklist_{frame_idx}.jpg"
                 cv2.imwrite(str(screenshot_path), frame_out)
@@ -764,7 +732,6 @@ def run_live(source):
 
                     face_info = track_to_face.get(tid)
                     
-                    
                     if face_info and face_info.get('status') == 'whitelist':
                         if 'cause' not in result:
                             result['cause'] = {}
@@ -802,7 +769,7 @@ def run_live(source):
                                 "confidence": result.get("confidence"),
                                 "cause": result.get("cause"),
                             },
-                            report_path=None,   # 🔥 NO REPORT (as you decided)
+                            report_path=None,
                             mode="LIVE"
                         )
                         alert_sent_for_event = True
@@ -826,16 +793,22 @@ def run_live(source):
                         screenshot=str(screenshot_path) if screenshot_path else None
                     )
 
-                    x, y = map(int, p["keypoints"][0])
-                    cv2.putText(
-                        frame_out,
-                        result["action"],
-                        (x, y - 25),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        result["color"],
-                        2
-                    )
+                    # 🔥 DRAW LABELS (using SCALED keypoints)
+                    # Find the scaled person
+                    for sp in scaled_persons:
+                        if sp["track_id"] == tid:
+                            if len(sp["keypoints"]) > 0:
+                                x, y = map(int, sp["keypoints"][0])
+                                cv2.putText(
+                                    frame_out,
+                                    result["action"],
+                                    (x, y - 25),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.7,
+                                    result["color"],
+                                    2
+                                )
+                            break
 
             if not active_event_this_frame and not blacklisted_in_frame:
                 event_mgr.update(
@@ -845,49 +818,30 @@ def run_live(source):
                 )
                 alert_sent_for_event = False
 
-            # NEW: Update camera scheduler and display info
-            if use_rotation:
-                camera_mgr.update_event_severity(current_severity)
-                
-                status = camera_mgr.get_status()
-                cv2.putText(
-                    frame_out,
-                    f"Cam {status['current_camera']} | {int(status['remaining_time'])}s | {status['event_severity']}",
-                    (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 0),
-                    2
-                )
-
-            # FPS display (unchanged)
+            # Track time for FPS calculation and update global
             now = time.time()
             fps_val = 1 / (now - prev_time + 1e-8)
             prev_time = now
+            
+            # 🔥 Update global FPS for API (smoothed average)
+            global CURRENT_FPS
+            CURRENT_FPS = int(fps_val * 0.2 + CURRENT_FPS * 0.8)  # Exponential smoothing
 
-            cv2.putText(
-                frame_out,
-                f"FPS: {int(fps_val)}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0),
-                2
-            )
+            if use_rotation:
+                camera_mgr.update_event_severity(current_severity)
 
-           # stream at max 15 FPS
             if API_MODE:
                 push_frame(frame_out)
 
-            # NEW: Check for camera rotation
             if STOP_LIVE:
                 break
 
             if use_rotation and camera_mgr.should_rotate():
                 if camera_mgr.rotate_camera():
-
                     fps = camera_mgr.get_fps()
                     event_mgr.fps = fps
+                    # Reset scale factors for new camera
+                    orig_width = None
                 else:
                     break
             
@@ -900,7 +854,6 @@ def run_live(source):
         import traceback
         traceback.print_exc()
     finally:
-        
         PAUSE_LIVE = False
 
         if use_rotation:
@@ -908,12 +861,11 @@ def run_live(source):
         else:
             cap.release()
 
-        # 🔥 VERY IMPORTANT
         global STREAM_FRAME
         with STREAM_LOCK:
             STREAM_FRAME = None
 
-    # Rest of the function remains unchanged (event finalization, PDF report, etc.)
+    # Generate report
     event_mgr.finalize()
     events = event_mgr.export()
 
@@ -935,7 +887,6 @@ def run_live(source):
 
         generate_pdf_report(event_buffer, summary_text, str(output_path))
         print(f"\n[REPORT] Generated → {output_path}")
-        
 
     except Exception as e:
         print(f"[ERROR] Report generation failed: {e}")

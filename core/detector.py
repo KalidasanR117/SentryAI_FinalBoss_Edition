@@ -1,7 +1,7 @@
 # sentry/core/detector.py
-
 from ultralytics import YOLO
 import numpy as np
+import torch
 
 # Object class names of your custom model
 ALL_OBJ_CLASSES = {
@@ -24,84 +24,117 @@ class Detector:
         """
         Unified detector with object tracking integration.
         """
-
+        
+        # 🔥 VERIFY CUDA AVAILABILITY
+        if device == "cuda" and not torch.cuda.is_available():
+            print("⚠️ CUDA requested but not available, falling back to CPU")
+            device = "cpu"
+        
+        print(f"[DETECTOR] Initializing with device: {device}")
+        
         # ==== POSE MODEL ====
         if pose_model is None:
             pose_model = "D:/Sentry_Final_Form/sentry/models/yolo11n-pose.pt"
-        self.pose_model = YOLO(pose_model).to(device)
+        
+        print(f"[DETECTOR] Loading pose model: {pose_model}")
+        self.pose_model = YOLO(pose_model)
+        
+        # 🔥 FORCE GPU EXPLICITLY
+        self.pose_model.to(device)
+        print(f"[DETECTOR] Pose model device: {self.pose_model.device}")
+        
+        # 🔥 FUSE LAYERS FOR SPEED
         self.pose_model.fuse()
-
+        
         # ==== OBJECT MODEL ====
         if obj_model_path is None:
             obj_model_path = "D:/Sentry_Final_Form/sentry/models/object_yolo.pt"
-        self.obj_model = YOLO(obj_model_path).to(device)
+        
+        print(f"[DETECTOR] Loading object model: {obj_model_path}")
+        self.obj_model = YOLO(obj_model_path)
+        
+        # 🔥 FORCE GPU EXPLICITLY
+        self.obj_model.to(device)
+        print(f"[DETECTOR] Object model device: {self.obj_model.device}")
+        
+        # 🔥 FUSE LAYERS FOR SPEED
         self.obj_model.fuse()
-
+        
         # ByteTrack config
         self.obj_tracker_config = "bytetrack.yaml"
-
+        
+        print("[DETECTOR] ✅ Initialization complete\n")
+    
     def infer(self, frame, obj_conf=0.25):
         """
         Runs tracked inference.
-
         Returns:
             persons: list of dicts with keys track_id, keypoints, confidence
             objects: list of dicts with keys track_id, cls, conf, bbox
         """
-
         persons = []
         objects = []
-
+        
         # === POSE + PERSON TRACKING ===
         pose_results = self.pose_model.track(
             frame,
             persist=True,
-            tracker="bytetrack.yaml",  # use ByteTrack for persons too
-            verbose=False
+            tracker="bytetrack.yaml",
+            verbose=False,
+            # 🔥 PERFORMANCE OPTIMIZATIONS
+            half=True,  # Use FP16 for faster inference
+            device=self.pose_model.device  # Explicitly pass device
         )
-
+        
         for r in pose_results:
             if r.keypoints is None or r.boxes.id is None:
                 continue
+            
             for i in range(len(r.boxes.id)):
                 tid = int(r.boxes.id[i])
                 kpts = r.keypoints.xy[i].cpu().numpy()
                 conf = r.keypoints.conf[i].cpu().numpy()
+                
                 persons.append({
                     "track_id": tid,
                     "keypoints": kpts,
                     "confidence": conf
                 })
-
+        
         # === OBJECT DETECTION + TRACKING ===
         obj_results = self.obj_model.track(
             frame,
             persist=True,
             tracker=self.obj_tracker_config,
-            verbose=False
+            verbose=False,
+            conf=obj_conf,
+            # 🔥 PERFORMANCE OPTIMIZATIONS
+            half=True,  # Use FP16 for faster inference
+            device=self.obj_model.device  # Explicitly pass device
         )
-
+        
         for r in obj_results:
             if r.boxes.id is None:
                 continue
+            
             for i in range(len(r.boxes.id)):
                 tid = int(r.boxes.id[i])
                 cls_id = int(r.boxes.cls[i])
                 conf = float(r.boxes.conf[i])
                 bbox = r.boxes.xyxy[i].cpu().numpy()
-
+                
                 # Map class id → name
                 cls_name = ALL_OBJ_CLASSES.get(cls_id, f"cls_{cls_id}")
-
+                
                 # Only keep knife and gun
                 if cls_name not in TARGET_OBJ_CLASSES:
                     continue
-
+                
                 objects.append({
                     "track_id": tid,
                     "cls": cls_name,
                     "conf": conf,
                     "bbox": bbox
                 })
-
+        
         return persons, objects

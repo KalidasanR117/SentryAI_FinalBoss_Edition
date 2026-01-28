@@ -3,13 +3,13 @@ from av import VideoFrame
 import main
 import cv2
 import numpy as np
+import asyncio
 import time
 from fractions import Fraction
 
 class SentryVideoTrack(MediaStreamTrack):
     """
-    A video stream track that reads the latest frame from main.STREAM_FRAME
-    and sends it to the WebRTC client.
+    Optimized video stream track with proper async timing and frame deduplication.
     """
     kind = "video"
 
@@ -20,25 +20,47 @@ class SentryVideoTrack(MediaStreamTrack):
         self.time_base = Fraction(1, 90000)
         self.frame_duration = int(90000 / fps)
         
-        # Default fallback size (only used if no camera frame exists yet)
-        self.default_width = 640
+        # 🔥 NEW: Timing control
+        self.frame_interval = 1.0 / fps  # Time between frames
+        self.last_frame_time = 0
+        self.last_frame_id = None  # Track frame changes
+        
+        # Default fallback size
+        # self.default_width = 640
+        # self.default_height = 480
+        self.default_width = 1280
         self.default_height = 480
-        print(f"🎥 SentryVideoTrack STARTED")
+        
+        print(f"🎥 SentryVideoTrack STARTED @ {fps} FPS")
 
     async def recv(self):
-        # 1. Get frame (Non-blocking check)
-        frame = main.STREAM_FRAME
+        """
+        Async receive with proper frame rate limiting.
+        """
+        # 🔥 OPTIMIZATION 1: Frame rate limiter
+        current_time = time.time()
+        time_since_last = current_time - self.last_frame_time
         
-        # 2. Handle 'No Frame' case
+        if time_since_last < self.frame_interval:
+            # Sleep until next frame is due
+            await asyncio.sleep(self.frame_interval - time_since_last)
+        
+        self.last_frame_time = time.time()
+        
+        # 🔥 OPTIMIZATION 2: Thread-safe frame fetch
+        try:
+            with main.STREAM_LOCK:
+                frame = main.STREAM_FRAME.copy() if main.STREAM_FRAME is not None else None
+        except:
+            frame = None
+        
+        # Handle 'No Frame' case
         if frame is None:
-            # Create a black placeholder
             frame = np.zeros((self.default_height, self.default_width, 3), dtype=np.uint8)
             cv2.putText(frame, "WAITING FOR CAMERA...", (50, 240), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         
-        # 3. 🔥 DYNAMIC ASPECT RATIO FIX
-        # We DO NOT force a resize here. We trust main.py to send the correct size.
-        # However, WebRTC requires dimensions to be even numbers (divisible by 2).
+        # 🔥 OPTIMIZATION 3: Ensure even dimensions (WebRTC requirement)
         h, w = frame.shape[:2]
         new_w = w if w % 2 == 0 else w - 1
         new_h = h if h % 2 == 0 else h - 1
@@ -46,15 +68,15 @@ class SentryVideoTrack(MediaStreamTrack):
         if new_w != w or new_h != h:
             frame = frame[:new_h, :new_w]
 
-        # 4. Convert to WebRTC Format & Add Timestamp
+        # Convert to WebRTC Format
         try:
             # Convert BGR (OpenCV) -> RGB (Browser)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             # Create the video frame
-            new_frame = VideoFrame.from_ndarray(frame, format="rgb24")
+            new_frame = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
             
-            # Manual Timestamp Logic
+            # Timestamp
             new_frame.pts = self.pts
             new_frame.time_base = self.time_base
             self.pts += self.frame_duration

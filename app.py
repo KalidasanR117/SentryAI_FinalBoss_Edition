@@ -13,6 +13,9 @@ from events.event_manager import EventManager
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from webrtc.video_track import SentryVideoTrack
 
+from fastapi.staticfiles import StaticFiles
+
+
 app = FastAPI(title="Sentry API")
 
 # Create Uploads Directory
@@ -199,7 +202,19 @@ def restart_live():
 
 @app.get("/api/live/status")
 def live_status():
-    return {"running": main.RUN_LIVE, "paused": main.PAUSE_LIVE}
+    # 🔥 Include actual FPS from backend
+    return {
+        "running": main.RUN_LIVE, 
+        "paused": main.PAUSE_LIVE,
+        "fps": main.CURRENT_FPS,  # Real inference FPS
+        "mode": main.CURRENT_MODE,
+        "camera_id": (
+    main.ACTIVE_CAMERA_MGR.get_status()["current_camera"]
+    if main.ACTIVE_CAMERA_MGR
+    else 0
+)
+
+    }
 
 @app.post("/api/live/resume")
 def resume_live():
@@ -237,3 +252,33 @@ async def shutdown():
         await pc.close()
     PEER_CONNECTIONS.clear()
 
+
+
+
+
+
+# ===============================
+# 🔥 STATIC FILE SERVING (LAN ACCESS)
+# ===============================
+SCREENSHOT_DIR = Path("reports/screenshots")
+REPORT_DIR = Path("reports")
+
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
+app.mount("/reports", StaticFiles(directory=str(REPORT_DIR)), name="reports")
+
+
+@app.get("/api/screenshots/live")
+def list_live_screenshots():
+    files = sorted(
+        SCREENSHOT_DIR.glob("*.jpg"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    return {
+        "screenshots": [
+            f"/screenshots/{f.name}" for f in files[:20]
+        ]
+    }
