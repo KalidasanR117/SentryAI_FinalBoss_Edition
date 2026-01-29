@@ -23,19 +23,20 @@ warnings.filterwarnings("ignore")
 # ============================================================
 # CONFIG (SAFE – DOES NOT AFFECT RECOGNITION)
 # ============================================================
+from facial_analysis.identity_store import load_identity_map
 
-FACE_GALLERY = "sentry/facial_analysis/face_gallery"
+FACE_GALLERY = "facial_analysis/face_gallery"
 
-WHITELIST = {
-    "Akshay",
-    "kalidasan",
-    "Mridul"
-}
+# WHITELIST = {
+#     "Akshay",
+#     "kalidasan",
+#     "Mridul"
+# }
 
-BLACKLIST = {
-    "Abhishek",
-    "Ajay"
-}
+# BLACKLIST = {
+#     "Abhishek",
+#     "Ajay"
+# }
 
 # ============================================================
 # ArcFace helpers (UNCHANGED)
@@ -159,7 +160,7 @@ def load_or_build_face_db(scrfd, arcface, gallery_dir):
 # Recognition helper (UNCHANGED)
 # ============================================================
 
-def find_name_for_embedding(emb, face_db, threshold=0.5):
+def find_name_for_embedding(emb, face_db, threshold=0.35):
     best_name, best_score = None, threshold
     for name, refs in face_db.items():
         for ref in refs:
@@ -231,12 +232,24 @@ def process_face_recognition(frame, scrfd, arcface, face_db, cache, next_face_id
 
         detected_names.append(name)  # ✅ FIX: collect names
 
-        if name in BLACKLIST:
-            status = "blacklist"
-        elif name in WHITELIST:
-            status = "whitelist"
-        else:
-            status = None
+        # if name in BLACKLIST:
+        #     status = "blacklist"
+        # elif name in WHITELIST:
+        #     status = "whitelist"
+        # else:
+        #     status = None
+        identity_map_raw = load_identity_map()
+
+        identity_map = {
+            k.strip().lower(): v.strip().lower()
+            for k, v in identity_map_raw.items()
+        }
+
+        name = name.strip().lower()
+        status = identity_map.get(name)
+        # print(f"[FACE MATCH] name={name} status={status}")
+
+
 
         new_cache[matched_id] = {
             "bbox": bbox,
@@ -245,12 +258,22 @@ def process_face_recognition(frame, scrfd, arcface, face_db, cache, next_face_id
             "status": status
         }
 
-        # -------- Identity annotation --------
-        if name in BLACKLIST:
+        # # -------- Identity annotation --------
+        # if name in BLACKLIST:
+        #     color = (0, 0, 255)
+        #     tag = "BLACKLIST"
+        # elif name in WHITELIST:
+        #     color = (255, 255, 255)
+        #     tag = "WHITELIST"
+        # else:
+        #     color = (0, 255, 255)
+        #     tag = "UNKNOWN"
+        # -------- Identity annotation (DYNAMIC) --------
+        if status == "blacklist":
             color = (0, 0, 255)
             tag = "BLACKLIST"
-        elif name in WHITELIST:
-            color = (255, 255, 255)
+        elif status == "whitelist":
+            color = (0, 255, 0)
             tag = "WHITELIST"
         else:
             color = (0, 255, 255)

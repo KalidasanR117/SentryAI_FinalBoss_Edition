@@ -9,10 +9,11 @@ class EventManager:
         self.current_event = None
         self.event_id = 0
     
+    # 🔥 FIX: Added 'extend=False' to the signature to prevent the TypeError
     def update(self, frame_idx, label, severity,
            confidence=None, face_ids=None,
            override=None, cause=None,
-           screenshot=None):
+           screenshot=None, extend=False):
 
         if face_ids is None:
             face_ids = []
@@ -21,6 +22,9 @@ class EventManager:
 
         # -------- Normal → close event --------
         if label in ["Normal", "Normal Motion"]:
+            # 🔥 Do NOT close critical face-based events (Blacklist lock)
+            if self.current_event and self.current_event.get("override") == "BLACKLIST":
+                return
             self._close_event(time_sec)
             return
 
@@ -55,8 +59,9 @@ class EventManager:
 
         # -------- Different label → close + reopen --------
         self._close_event(time_sec)
+        # Recursively call update for the new event
         self.update(frame_idx, label, severity,
-                    confidence, face_ids, override, cause, screenshot)
+                    confidence, face_ids, override, cause, screenshot, extend)
 
 
     def _close_event(self, time_sec):
@@ -68,11 +73,17 @@ class EventManager:
             self.current_event["end_time"] -
             self.current_event["start_time"], 2
         )
+        # Convert set to list for JSON serialization
         self.current_event["persons"] = list(
             self.current_event["persons"]
         )
         self.events.append(self.current_event)
         self.current_event = None
+
+    def end_current_event(self, frame_idx):
+        """Force close the current event (used by main.py to release blacklist lock)"""
+        time_sec = frame_idx / self.fps
+        self._close_event(time_sec)
 
     def finalize(self):
         if self.current_event:
@@ -85,6 +96,7 @@ class EventManager:
 
     def export(self):
         return self.events
+
     def is_new_event(self, track_id, label):
         """
         Returns True if this (track_id, label) pair

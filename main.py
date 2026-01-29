@@ -16,7 +16,7 @@ import onnxruntime as ort
 from pathlib import Path
 from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
 from alerts.notifier import send_critical_alert
-
+from alerts.telegram_notifier import telegram_bot
 # ========================= LIVE PIPELINE IMPORTS =========================
 from core.detector import Detector
 from core.pose_buffer import PoseBuffer
@@ -29,8 +29,10 @@ from pose_face_main import load_or_build_face_db, process_face_recognition
 
 # ========================= CONFIG & GLOBALS =========================
 # 🔥 DISPLAY RESOLUTION (not inference resolution)
-DISPLAY_WIDTH = 640
-DISPLAY_HEIGHT = 480
+DISPLAY_WIDTH = 1280
+DISPLAY_HEIGHT = 720
+BLACKLIST_HOLD_FRAMES = 15  # ~0.5 sec @30fps
+blacklist_hold_counter = 0
 
 SEVERITY_RANK = {
     EventSeverity.NORMAL: 0, EventSeverity.LOW: 1,
@@ -391,6 +393,7 @@ def run_pose_offline(video_path):
         txt = generate_llm_summary(events=buf, mode="POSE_OFFLINE")
         out = OFFLINE_REPORT_DIR / f"pose_report_{datetime.now().strftime('%H%M%S')}.pdf"
         generate_pdf_report(buf, txt, str(out))
+        telegram_bot.send_report(str(out), txt)
     except: pass
 
     stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE")
@@ -490,74 +493,72 @@ def run_offline(video_path):
         txt = generate_llm_summary(events=buf, mode="OFFLINE")
         out = OFFLINE_REPORT_DIR / f"transformer_report_{datetime.now().strftime('%H%M%S')}.pdf"
         generate_pdf_report(buf, txt, str(out))
+        telegram_bot.send_report(str(out), txt)
     except Exception as e:
         print("[OFFLINE TRANSFORMER REPORT ERROR]", e)
 
     stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="TRANSFORMER")
     send_offline_summary_alert(events, mode="OFFLINE")
 
-# ========================= 🔥 FIXED LIVE MODE (SAME LOGIC AS OFFLINE) =========================
+# ... imports remain same ...
+
+# ========================= 🔥 FIXED LIVE MODE WITH COOLDOWN =========================
+# ========================= 🔥 FIXED LIVE MODE (DIRECT FACE ALERT) =========================
 def run_live(source):
     global RUN_LIVE, PAUSE_LIVE, STOP_LIVE
     RUN_LIVE = True
     PAUSE_LIVE = False
-    alert_sent_for_event = False
+    
+    # 🔥 COOLDOWN CONFIG
+    BLACKLIST_ALERT_COOLDOWN = 15
+    last_blacklist_alert_time = 0
+    
+    blacklist_active = False
+    blacklist_hold_counter = 0
+    last_blacklisted_faces = []
 
     print("[MODE] LIVE")
-    print("CUDA available:", torch.cuda.is_available())
-    print("CUDA device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
 
+    # ... (Init logic remains same) ...
     try:
         validate_paths()
     except FileNotFoundError as e:
         print(f"[ERROR] {e}")
         return
 
-    # ===================== CAMERA SETUP =====================
+    # Camera Init
     camera_mgr = None
     use_rotation = (str(source) == "0" or source == 0) and (source != "1") 
     
     if use_rotation:
         print("[CAMERA] Initializing multi-camera rotation...")
-        config = CameraConfig(
-            base_time_window=10.0,
-            max_scan_index=10
-        )
-        
+        config = CameraConfig(base_time_window=10.0, max_scan_index=10)
         global CAMERA_MANAGER
         CAMERA_MANAGER = CameraManager(config)
         camera_mgr = CAMERA_MANAGER
-
         if not camera_mgr.initialize():
-            print("[WARNING] Falling back to single camera")
             use_rotation = False
         else:
-            if not camera_mgr.start_camera():
-                print("[ERROR] Failed to start camera")
-                return
+            if not camera_mgr.start_camera(): return
             fps = camera_mgr.get_fps()
         global ACTIVE_CAMERA_MGR
         ACTIVE_CAMERA_MGR = camera_mgr
 
     if not use_rotation:
         cap = cv2.VideoCapture(source)
-        if not cap.isOpened():
-            print(f"[ERROR] Could not open: {source}")
-            return
+        if not cap.isOpened(): return
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
 
-    # ===================== INIT MODELS =====================
+    # Model Init
     try:
         scrfd = SCRFD(model_path=str(SCRFD_MODEL))
         arcface = create_onnx_session(ARCFACE_MODEL)
         face_db = load_or_build_face_db(scrfd, arcface, str(FACE_GALLERY))
-        
         detector = Detector()
         pose_buffer = PoseBuffer(max_len=30)
         rule_engine = RuleEngine(history=30)
-        
     except Exception as e:
-        print(f"[ERROR] Model initialization failed: {e}")
+        print(f"[ERROR] Model init failed: {e}")
         return
 
     event_mgr = EventManager(fps=fps, source="LIVE")
@@ -566,25 +567,18 @@ def run_live(source):
     cache = {}
     next_face_id = 0
     frame_store = {}
-    
     last_face_results = {}
-    
-    # 🔥 Store original frame dimensions for scaling
     orig_width = None
     orig_height = None
 
     # ===================== MAIN LOOP =====================
     try:
         while RUN_LIVE and not STOP_LIVE:
-            if STOP_LIVE:
-                print("[LIVE] Stop requested → breaking loop")
-                break
-                
+            if STOP_LIVE: break
             if PAUSE_LIVE:
                 time.sleep(0.05)
                 continue
 
-            # Read frame at ORIGINAL resolution
             if use_rotation:
                 ret, frame = camera_mgr.read_frame()
                 if not ret:
@@ -592,140 +586,124 @@ def run_live(source):
                         fps = camera_mgr.get_fps()
                         event_mgr.fps = fps
                         continue
-                    else:
-                        break
+                    else: break
             else:
                 ret, frame = cap.read()
-                if not ret:
-                    break
+                if not ret: break
 
-            # 🔥 CRITICAL: Get original dimensions on first frame
             if orig_width is None:
                 orig_height, orig_width = frame.shape[:2]
-                print(f"[LIVE] Original: {orig_width}x{orig_height}, Display: {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}")
 
             if frame_idx % int(fps) == 0:
                 frame_store[frame_idx] = frame.copy()
 
-            # 1. POSE DETECTION at ORIGINAL resolution (no resize!)
+            # 1. POSE
             persons, objects = detector.infer(frame)
+            for p in persons: pose_buffer.update(p["track_id"], p["keypoints"])
 
-            for p in persons:
-                pose_buffer.update(p["track_id"], p["keypoints"])
-
-            # 2. RULE ENGINE
+            # 2. RULES
             rule_results = rule_engine.update(persons, objects)
 
-            # 3. FACE RECOGNITION (every 5 frames)
-            if frame_idx % 5 == 0:
-                frame, cache, next_face_id, face_results = process_face_recognition(
+            # 3. FACE (Optimize: Run every 5 frames, or every frame if hardware allows)
+            # if frame_idx % 5 == 0:
+            frame, cache, next_face_id, face_results = process_face_recognition(
                     frame, scrfd, arcface, face_db, cache, next_face_id
                 )
-                last_face_results = face_results
-            else:
-                face_results = last_face_results
+                # last_face_results = face_results
+            # else:
+                # face_results = last_face_results
             
             track_to_face = match_faces_to_poses(persons, face_results)
 
-            # 4. 🔥 LETTERBOX FRAME FOR DISPLAY (maintain aspect ratio with black bars)
-            # Calculate scale to fit in display box
+            # 4. DISPLAY SCALING
             scale = min(DISPLAY_WIDTH / orig_width, DISPLAY_HEIGHT / orig_height)
             new_width = int(orig_width * scale)
             new_height = int(orig_height * scale)
-            
-            # Resize frame
             display_frame = cv2.resize(frame, (new_width, new_height))
-            
-            # Create black canvas and center the frame
             canvas = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
             x_offset = (DISPLAY_WIDTH - new_width) // 2
             y_offset = (DISPLAY_HEIGHT - new_height) // 2
             canvas[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = display_frame
             display_frame = canvas
-            
-            # Update scale factors for keypoints (accounting for offset)
-            scale_x = scale
-            scale_y = scale
+            scale_x = scale; scale_y = scale
 
-            # 5. 🔥 SCALE KEYPOINTS TO MATCH DISPLAY (accounting for letterbox offset)
             scaled_persons = []
             for p in persons:
                 kp = p["keypoints"].copy()
-                kp[:, 0] = kp[:, 0] * scale_x + x_offset  # Scale X + offset
-                kp[:, 1] = kp[:, 1] * scale_y + y_offset  # Scale Y + offset
-                
-                scaled_persons.append({
-                    "keypoints": kp,
-                    "confidence": np.ones(len(kp)),
-                    "track_id": p["track_id"]
-                })
+                kp[:, 0] = kp[:, 0] * scale_x + x_offset
+                kp[:, 1] = kp[:, 1] * scale_y + y_offset
+                scaled_persons.append({"keypoints": kp, "confidence": np.ones(len(kp)), "track_id": p["track_id"]})
 
-            # 6. DRAW POSES on scaled frame
             frame_out = draw_pose(display_frame, scaled_persons)
             
-            # 🔥 SAFETY: Ensure frame_out has correct dimensions
             out_h, out_w = frame_out.shape[:2]
             if out_w != DISPLAY_WIDTH or out_h != DISPLAY_HEIGHT:
-                print(f"[WARNING] Frame size mismatch! Expected {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}, got {out_w}x{out_h}")
                 frame_out = cv2.resize(frame_out, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
-            
-            # Debug: Show frame dimensions periodically
-            if frame_idx % 60 == 0:
-                print(f"[DEBUG] Frame: {new_width}x{new_height}, Offset: ({x_offset}, {y_offset}), Scale: {scale:.3f}")
 
-            # 7. EVENT TRACKING
+            # 7. EVENT TRACKING & ALERTS
             current_severity = EventSeverity.NORMAL
             
-            blacklisted_in_frame = [
-                info['name'] for tid, info in track_to_face.items() 
-                if info.get('status') == 'blacklist'
+            # 🔥🔥🔥 FIX: CHECK RAW FACES, NOT POSE MATCHES 🔥🔥🔥
+            # Old way: check track_to_face (required body+face match)
+            # New way: check face_results directly (requires only face)
+            blacklisted_faces = [
+                data["name"] for data in face_results.values()
+                if data.get("status") == "blacklist"
             ]
-            
-            if blacklisted_in_frame:
-                current_severity = EventSeverity.CRITICAL
-                
-                screenshot_path = SCREENSHOT_DIR / f"blacklist_{frame_idx}.jpg"
-                cv2.imwrite(str(screenshot_path), frame_out)
 
+            if blacklisted_faces:
+                blacklist_hold_counter = BLACKLIST_HOLD_FRAMES
+                last_blacklisted_faces = blacklisted_faces[:]
+            else:
+                blacklist_hold_counter = max(0, blacklist_hold_counter - 1)
+
+            blacklist_active = blacklist_hold_counter > 0   
+
+            if blacklist_active:
+                names_to_report = blacklisted_faces if blacklisted_faces else last_blacklisted_faces
+                
+                # Update Dashboard
                 event_mgr.update(
                     frame_idx=frame_idx,
                     label="Blacklisted Person Detected",
                     severity="CRITICAL",
                     confidence=1.0,
-                    face_ids=blacklisted_in_frame,
+                    face_ids=names_to_report,
                     override="BLACKLIST",
                     cause={
                         "trigger": "FACE_RECOGNITION",
                         "rule_name": "BLACKLIST_MATCH",
-                        "description": "Known blacklisted individual detected",
-                        "joints_involved": [],
-                        "metrics": {"faces": blacklisted_in_frame}
-                    },
-                    screenshot=str(screenshot_path)
+                        "metrics": {"faces": names_to_report}
+                    }
                 )
 
-            active_event_this_frame = False
-            if blacklisted_in_frame and not alert_sent_for_event:
-                send_critical_alert(
-                    event={
-                        "type": "Blacklisted Person Detected",
-                        "severity": "CRITICAL",
-                        "confidence": 1.0,
-                        "cause": {
-                            "description": "Known blacklisted individual detected"
-                        }
-                    },
-                    report_path=None,
-                    mode="LIVE"
-                )
-                alert_sent_for_event = True
+                # 🔥 TRIGGER ALERT (Direct Check)
+                if (time.time() - last_blacklist_alert_time) > BLACKLIST_ALERT_COOLDOWN:
+                    print(f"[ALERT] 🚨 Sending Blacklist Alert for: {names_to_report}")
+                    try:
+                        send_critical_alert(
+                            event={
+                                "type": "Blacklisted Person Detected",
+                                "severity": "CRITICAL",
+                                "confidence": 1.0,
+                                "cause": {"faces": names_to_report}
+                            },
+                            report_path=None,
+                            mode="LIVE"
+                        )
+                        last_blacklist_alert_time = time.time()
+                    except Exception as e:
+                        print(f"[ALERT ERROR] Could not send email: {e}")
 
+            else:
+                if event_mgr.current_event and event_mgr.current_event["type"] == "Blacklisted Person Detected":
+                    event_mgr.end_current_event(frame_idx)
+
+            # --- GENERAL RULE LOGIC ---
             for p in persons:
                 tid = p["track_id"]
-
                 if tid in rule_results:
                     result = rule_results[tid].copy()
-                    
                     result_severity = map_severity_to_enum(result['severity'])
                     if SEVERITY_RANK[result_severity] > SEVERITY_RANK[current_severity]:
                         current_severity = result_severity
@@ -733,52 +711,21 @@ def run_live(source):
                     face_info = track_to_face.get(tid)
                     
                     if face_info and face_info.get('status') == 'whitelist':
-                        if 'cause' not in result:
-                            result['cause'] = {}
-                        if 'metrics' not in result['cause']:
-                            result['cause']['metrics'] = {}
-                        
+                        if 'cause' not in result: result['cause'] = {}
+                        if 'metrics' not in result['cause']: result['cause']['metrics'] = {}
                         result['cause']['metrics']['whitelisted_person'] = face_info['name']
-                        result['cause']['whitelist_note'] = f"Whitelisted person '{face_info['name']}' involved"
-                        
                         if result['severity'] == 'MEDIUM':
-                            original_action = result['action']
-                            result['action'] = f"{original_action} (Whitelisted - Low Priority)"
+                            result['action'] += " (Whitelisted)"
                             result['severity'] = 'LOW'
                             result['color'] = SEVERITY_COLORS['LOW']
                     
+                    # Also keep pose-based blacklist priority for rule engine display
                     elif face_info and face_info.get('status') == 'blacklist':
-                        if 'cause' not in result:
-                            result['cause'] = {}
-                        if 'metrics' not in result['cause']:
-                            result['cause']['metrics'] = {}
-                        
-                        result['cause']['metrics']['blacklisted_person'] = face_info['name']
-                        result['cause']['blacklist_note'] = f"ALERT: Blacklisted person '{face_info['name']}' involved"
-                        
-                        if result['severity'] != 'CRITICAL':
-                            result['severity'] = 'CRITICAL'
-                            result['color'] = SEVERITY_COLORS['CRITICAL']
+                        result['severity'] = 'CRITICAL'
+                        result['color'] = SEVERITY_COLORS['CRITICAL']
                 
-                    active_event_this_frame = True
-                    if result["severity"] == "CRITICAL" and not alert_sent_for_event:
-                        send_critical_alert(
-                            event={
-                                "type": result["action"],
-                                "severity": result["severity"],
-                                "confidence": result.get("confidence"),
-                                "cause": result.get("cause"),
-                            },
-                            report_path=None,
-                            mode="LIVE"
-                        )
-                        alert_sent_for_event = True
-                    
                     screenshot_path = None
-                    if (
-                        event_mgr.current_event is None or
-                        event_mgr.current_event["type"] != result["action"]
-                    ):
+                    if (event_mgr.current_event is None or event_mgr.current_event["type"] != result["action"]):
                         screenshot_path = SCREENSHOT_DIR / f"event_{frame_idx}_track_{tid}.jpg"
                         cv2.imwrite(str(screenshot_path), frame_out)
 
@@ -786,111 +733,84 @@ def run_live(source):
                         frame_idx=frame_idx,
                         label=result["action"],
                         severity=result["severity"],
-                        confidence=None,
                         face_ids=[tid],
-                        override=None,
                         cause=result.get("cause"),
                         screenshot=str(screenshot_path) if screenshot_path else None
                     )
 
-                    # 🔥 DRAW LABELS (using SCALED keypoints)
-                    # Find the scaled person
+                    # General Alerts (Violence/Theft)
+                    if result["severity"] in ["HIGH", "CRITICAL"]:
+                        if event_mgr.is_new_event(tid, result["action"]):
+                            send_critical_alert(
+                                event={
+                                    "type": result["action"],
+                                    "severity": result["severity"],
+                                    "confidence": 0.95,
+                                    "cause": result.get("cause", {})
+                                },
+                                report_path=str(screenshot_path) if screenshot_path else None,
+                                mode="LIVE"
+                            )
+
+                    # Draw Text
                     for sp in scaled_persons:
-                        if sp["track_id"] == tid:
-                            if len(sp["keypoints"]) > 0:
-                                x, y = map(int, sp["keypoints"][0])
-                                cv2.putText(
-                                    frame_out,
-                                    result["action"],
-                                    (x, y - 25),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.7,
-                                    result["color"],
-                                    2
-                                )
-                            break
+                        if sp["track_id"] == tid and len(sp["keypoints"]) > 0:
+                            x, y = map(int, sp["keypoints"][0])
+                            cv2.putText(frame_out, result["action"], (x, y - 25),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, result["color"], 2)
 
-            if not active_event_this_frame and not blacklisted_in_frame:
-                event_mgr.update(
-                    frame_idx=frame_idx,
-                    label="Normal",
-                    severity="LOW"
-                )
-                alert_sent_for_event = False
+            if not blacklist_active and not rule_results:
+                event_mgr.update(frame_idx, "Normal", "LOW")
 
-            # Track time for FPS calculation and update global
+            # FPS & Loop Updates
             now = time.time()
             fps_val = 1 / (now - prev_time + 1e-8)
             prev_time = now
-            
-            # 🔥 Update global FPS for API (smoothed average)
             global CURRENT_FPS
-            CURRENT_FPS = int(fps_val * 0.2 + CURRENT_FPS * 0.8)  # Exponential smoothing
+            CURRENT_FPS = int(fps_val * 0.2 + CURRENT_FPS * 0.8)
 
-            if use_rotation:
-                camera_mgr.update_event_severity(current_severity)
-
-            if API_MODE:
-                push_frame(frame_out)
-
-            if STOP_LIVE:
-                break
+            if use_rotation: camera_mgr.update_event_severity(current_severity)
+            if API_MODE: push_frame(frame_out)
+            if STOP_LIVE: break
 
             if use_rotation and camera_mgr.should_rotate():
                 if camera_mgr.rotate_camera():
                     fps = camera_mgr.get_fps()
                     event_mgr.fps = fps
-                    # Reset scale factors for new camera
                     orig_width = None
-                else:
-                    break
+                else: break
             
             frame_idx += 1
 
     except KeyboardInterrupt:
-        print("\n[INFO] Interrupted by user")
+        print("\n[INFO] Interrupted")
     except Exception as e:
-        print(f"[ERROR] Runtime error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[ERROR] Runtime: {e}")
+        import traceback; traceback.print_exc()
     finally:
         PAUSE_LIVE = False
-
-        if use_rotation:
-            camera_mgr.stop_camera()
-        else:
-            cap.release()
-
+        if use_rotation: camera_mgr.stop_camera()
+        else: cap.release()
         global STREAM_FRAME
-        with STREAM_LOCK:
-            STREAM_FRAME = None
+        with STREAM_LOCK: STREAM_FRAME = None
 
-    # Generate report
     event_mgr.finalize()
     events = event_mgr.export()
-
-    print("\n=== FINAL EVENT TIMELINE ===")
-    for e in events:
-        print(e)
-
+    # ... Report gen ...
     try:
         from reports.event_adapter import adapt_events_for_pdf
         from reports.pdf_report import generate_pdf_report
         from llm.summary_generator import generate_llm_summary
         from datetime import datetime
-
         event_buffer = adapt_events_for_pdf(events, frame_store)
         summary_text = generate_llm_summary(events=event_buffer, mode="LIVE")
-
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = REPORTS_DIR / f"sentry_live_report_{ts}.pdf"
-
         generate_pdf_report(event_buffer, summary_text, str(output_path))
         print(f"\n[REPORT] Generated → {output_path}")
-
+        telegram_bot.send_report(str(output_path), summary_text)
     except Exception as e:
         print(f"[ERROR] Report generation failed: {e}")
-
 # ========================= ENTRY POINT =========================
 if __name__ == "__main__":
     if API_ONLY:
