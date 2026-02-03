@@ -503,7 +503,7 @@ class RuleEngine:
                     max_reach = torso_height * 2.5
                     
                     # INVALIDATE IF: Not aiming at target OR Target is out of range
-                    if attack_angle > 45 or foot_dist > max_reach:
+                    if attack_angle > 65 or foot_dist > max_reach:
                         kick_features = []  # Discard false positive
 
             rapid_count = 0
@@ -522,15 +522,15 @@ class RuleEngine:
             metrics = {}
             is_fallen = self.detect_fallen_posture(kps, conf)
 
-            if is_fallen and involved_interaction:
-                action = "Ground Fight / Person Down"
-                severity = "CRITICAL"
-                rule_name = "PERSON_FALLEN_IN_FIGHT"
-                cause_desc = "Person detected on ground in close proximity to another"
-                joints = ["shoulder", "hip"] # General body alignment
-                metrics = {"aspect_ratio_width": "high"}
+            # if is_fallen and involved_interaction:
+            #     action = "Ground Fight / Person Down"
+            #     severity = "CRITICAL"
+            #     rule_name = "PERSON_FALLEN_IN_FIGHT"
+            #     cause_desc = "Person detected on ground in close proximity to another"
+            #     joints = ["shoulder", "hip"] # General body alignment
+            #     metrics = {"aspect_ratio_width": "high"}
             # CRITICAL: Active physical violence
-            elif strike_detected and punch_features and hand_metrics and hand_metrics['rapid_extension']:
+            if strike_detected and punch_features and hand_metrics and hand_metrics['rapid_extension']:
                 action = "Active Physical Assault"
                 severity = "CRITICAL"
                 rule_name = "STRIKE_IMPACT_DETECTED"
@@ -544,7 +544,7 @@ class RuleEngine:
                 # Record strike with timestamp
                 self.strike_hist[tid].append(self.frame_count)
             
-            elif kick_features and involved_interaction and involved_interaction['distance'] < 100 and leg_velocity > 35:
+            elif kick_features and involved_interaction and involved_interaction['distance'] < 100 and (leg_velocity > 35 or kick_features[0]['angle'] > 150):
                 action = "Kicking Attack"
                 severity = "CRITICAL"
                 rule_name = "KICK_IN_PROXIMITY"
@@ -577,7 +577,7 @@ class RuleEngine:
                 joints = ["shoulder", "elbow", "wrist"]
                 metrics = {"proximity": involved_interaction['distance']}
             
-            elif aggressive_stance and involved_interaction and involved_interaction['distance'] < 100:
+            elif aggressive_stance and involved_interaction and foot_dist < torso_height * 1.2:
                 action = "Confrontational Stance"
                 severity = "HIGH"
                 rule_name = "AGGRESSIVE_STANCE_CLOSE_PROXIMITY"

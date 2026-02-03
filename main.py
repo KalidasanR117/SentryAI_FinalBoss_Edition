@@ -371,6 +371,22 @@ def run_pose_offline(video_path):
             if p["track_id"] in rule_results:
                 res = rule_results[p["track_id"]]
                 if res["severity"] != "NORMAL":
+                    
+                    screenshot_path = None
+                    if event_mgr.is_new_event(p["track_id"], res["action"]):
+                        screenshot_path = OFFLINE_SCREENSHOT_DIR / f"pose_event_{frame_idx}_track_{p['track_id']}.jpg"
+                        cv2.imwrite(str(screenshot_path), frame)
+
+                    event_mgr.update(
+                        frame_idx=frame_idx,
+                        label=res["action"],
+                        severity=res["severity"],
+                        face_ids=[p["track_id"]],
+                        screenshot=str(screenshot_path) if screenshot_path else None,
+                        cause=res.get("cause")
+                    )
+                    active = True
+    
                     event_mgr.update(frame_idx=frame_idx, label=res["action"], severity=res["severity"], face_ids=[p["track_id"]])
                     active = True
         

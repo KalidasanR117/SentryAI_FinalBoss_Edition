@@ -428,3 +428,61 @@ def list_reports():
 
     # Sort by newest first
     return sorted(reports, key=lambda x: x['date'] + x['time'], reverse=True)
+
+
+
+
+
+
+
+
+
+# ... imports ...
+from core import face_engine_sota # Ensure this is correct
+
+# ... inside app.py ...
+@app.get("/api/sota/status")
+def sota_status():
+    return ANALYSIS_STATUS
+
+@app.post("/api/sota/analyze")
+async def analyze_sota_video(file: UploadFile = File(...)):
+    global ANALYSIS_STATUS
+    
+    # 1. Save Input
+    filename = f"sota_in_{int(time.time())}_{file.filename}"
+    file_path = UPLOAD_DIR / filename
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    # 2. Output Path (🔥 CHANGED TO .webm FOR BROWSER SUPPORT)
+    out_filename = f"sota_out_{int(time.time())}.mp4"
+    final_output = Path("reports") / out_filename
+    
+    # 3. Report Path (🔥 NEW)
+    report_filename = f"sota_report_{int(time.time())}.pdf"
+    final_report = Path("reports") / report_filename
+    
+    ANALYSIS_STATUS = {"progress": 0, "status": "processing", "file": out_filename}
+
+    def run_job():
+        global ANALYSIS_STATUS
+        def update_prog(p):
+            ANALYSIS_STATUS["progress"] = p
+            
+        try:
+            face_engine_sota.run_analysis(
+                str(file_path), 
+                str(final_output),
+                str(final_report), # Pass report path
+                update_prog
+            )
+            ANALYSIS_STATUS["status"] = "completed"
+            ANALYSIS_STATUS["progress"] = 100
+        except Exception as e:
+            print(f"[SOTA ERROR] {e}")
+            ANALYSIS_STATUS["status"] = "failed"
+
+    threading.Thread(target=run_job, daemon=True).start()
+    
+    return {"status": "started", "job_id": out_filename}

@@ -77,6 +77,8 @@ class EventManager:
         self.current_event["persons"] = list(
             self.current_event["persons"]
         )
+        if hasattr(self, "_active_keys"):
+            self._active_keys.clear()
         self.events.append(self.current_event)
         self.current_event = None
 
