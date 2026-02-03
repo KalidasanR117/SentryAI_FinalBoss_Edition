@@ -41,7 +41,7 @@ SEVERITY_RANK = {
 
 API_MODE = True
 STREAM_FRAME = None
-CURRENT_FPS = 0  # 🔥 NEW: Global FPS counter for API
+CURRENT_FPS = 0  
 import threading
 STREAM_LOCK = threading.Lock()
 API_ONLY = True
@@ -51,6 +51,13 @@ STOP_LIVE = False
 CAMERA_MANAGER = None
 ACTIVE_CAMERA_MGR = None
 CURRENT_MODE = "IDLE"  
+
+# 🔥 NEW: GLOBAL PROGRESS TRACKER FOR API
+OFFLINE_STATUS = {
+    "progress": 0,
+    "status": "IDLE",
+    "mode": None
+}
 
 BASE_DIR = Path(__file__).resolve().parent
 FACE_GALLERY = BASE_DIR / "facial_analysis" / "face_gallery"
@@ -78,6 +85,12 @@ OFFLINE_SCREENSHOT_DIR = OFFLINE_REPORT_DIR / "screenshots"
 for d in [SCREENSHOT_DIR, OFFLINE_SCREENSHOT_DIR]: d.mkdir(parents=True, exist_ok=True)
 
 # ========================= HELPERS =========================
+def update_offline_progress(prog, status_msg):
+    """Helper to update global status safely"""
+    global OFFLINE_STATUS
+    OFFLINE_STATUS["progress"] = prog
+    OFFLINE_STATUS["status"] = status_msg
+
 def create_onnx_session(model_path):
     providers = [
         ("CUDAExecutionProvider", {
@@ -196,6 +209,9 @@ def send_offline_summary_alert(events, mode):
 def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE"):
     global RUN_LIVE, STOP_LIVE
 
+    # 🔥 Mark as complete so UI switches to player
+    update_offline_progress(100, "Playback Started")
+    
     RUN_LIVE = True
     STOP_LIVE = False
 
@@ -336,6 +352,8 @@ def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE
 # ========================= OFFLINE POSE (NO FACE REC) =========================
 def run_pose_offline(video_path):
     print("[MODE] POSE OFFLINE (Face Rec: OFF)")
+    update_offline_progress(0, "Initializing Pose Models...")
+    
     if not Path(video_path).exists(): return
 
     try:
@@ -393,10 +411,17 @@ def run_pose_offline(video_path):
         if not active:
             event_mgr.update(frame_idx=frame_idx, label="Normal", severity="LOW")
 
-        if frame_idx % 50 == 0: print(f"   Progress: {int(frame_idx/total_frames*100)}%", end='\r')
+        # 🔥 UPDATE PROGRESS
+        if frame_idx % 10 == 0:
+            progress = int((frame_idx / total_frames) * 90) # Save 10% for report gen
+            update_offline_progress(progress, f"Analyzing Movements ({progress}%)")
+            print(f"   Progress: {progress}%", end='\r')
+
         frame_idx += 1
 
     cap.release()
+    update_offline_progress(90, "Generating Final Report...")
+
     event_mgr.finalize()
     events = event_mgr.export()
     
@@ -412,12 +437,15 @@ def run_pose_offline(video_path):
         telegram_bot.send_report(str(out), txt)
     except: pass
 
+    update_offline_progress(100, "Starting Replay...")
     stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE")
     send_offline_summary_alert(events, mode="OFFLINE")
 
 # ========================= OFFLINE TRANSFORMER (NO FACE REC) =========================
 def run_offline(video_path):
     print("[MODE] TRANSFORMER OFFLINE (Face Rec: OFF)")
+    update_offline_progress(0, "Initializing Transformer Model...")
+    
     if not Path(video_path).exists(): return
 
     try:
@@ -430,6 +458,8 @@ def run_offline(video_path):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     frames = []
+    
+    update_offline_progress(5, "Loading Video Frames...")
     print("[INFO] Loading video into RAM...")
     while True:
         ret, f = cap.read()
@@ -449,6 +479,8 @@ def run_offline(video_path):
     frame_store = {}
 
     print("[INFO] Running VideoMAE...")
+    update_offline_progress(10, "Starting VideoMAE Analysis...")
+
     for i in range(0, total_frames - NUM_FRAMES, STRIDE):
         if i % int(fps) == 0: frame_store[i] = frames[i].copy()
 
@@ -473,7 +505,14 @@ def run_offline(video_path):
                 else:
                     labels[j] = "Normal"
         
-        if i % 100 == 0: print(f"   MAE Progress: {int(i/total_frames*100)}%", end='\r')
+        # 🔥 UPDATE PROGRESS
+        if i % 100 == 0: 
+            # Calculate progress from 10% to 90%
+            current_pct = 10 + int((i / total_frames) * 80)
+            update_offline_progress(current_pct, f"Analyzing Complexity ({current_pct}%)")
+            print(f"   MAE Progress: {int(i/total_frames*100)}%", end='\r')
+
+    update_offline_progress(90, "Building Event Timeline...")
 
     frame_data_map = {}
     for i in range(total_frames):
@@ -500,6 +539,8 @@ def run_offline(video_path):
             cause=e.get("cause")
         )
 
+    update_offline_progress(95, "Generating Final Report...")
+
     try:
         from reports.event_adapter import adapt_events_for_pdf
         from reports.pdf_report import generate_pdf_report
@@ -513,6 +554,7 @@ def run_offline(video_path):
     except Exception as e:
         print("[OFFLINE TRANSFORMER REPORT ERROR]", e)
 
+    update_offline_progress(100, "Starting Replay...")
     stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="TRANSFORMER")
     send_offline_summary_alert(events, mode="OFFLINE")
 

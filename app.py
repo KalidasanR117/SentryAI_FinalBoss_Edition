@@ -486,3 +486,9 @@ async def analyze_sota_video(file: UploadFile = File(...)):
     threading.Thread(target=run_job, daemon=True).start()
     
     return {"status": "started", "job_id": out_filename}
+
+
+# Add this endpoint in app.py to expose the main.py status
+@app.get("/api/offline/status")
+def get_offline_status():
+    return main.OFFLINE_STATUS
