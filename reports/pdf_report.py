@@ -180,12 +180,23 @@ class PDFReport(FPDF):
             self.set_font("Helvetica", "", 11)
             self.set_text_color(*self.COLOR_LIGHT_GREY)
 
+            # 🔥 FIX: Format metrics properly instead of showing raw dict
+            metrics = cause.get('metrics', {})
+            if isinstance(metrics, dict) and metrics:
+                metrics_lines = []
+                for k, v in metrics.items():
+                    key_display = k.replace('_', ' ').title()
+                    metrics_lines.append(f"    {key_display}: {v}")
+                metrics_text = "\n".join(metrics_lines)
+            else:
+                metrics_text = str(metrics)
+
             text = (
                 f"Trigger Source : {cause.get('trigger')}\n"
                 f"Rule Name      : {cause.get('rule_name')}\n"
                 f"Description    : {cause.get('description')}\n"
                 f"Joints         : {', '.join(cause.get('joints_involved', []))}\n"
-                f"Metrics        : {cause.get('metrics')}"
+                f"Metrics        :\n{metrics_text}"
             )
 
             self.multi_cell(0, 7, KNOWN_SAFE(text))

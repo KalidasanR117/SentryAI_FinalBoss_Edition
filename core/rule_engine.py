@@ -442,8 +442,8 @@ class RuleEngine:
                         "description": "Person detected but insufficient pose history for analysis",
                         "joints_involved": [],
                         "metrics": {
-                            "frames_tracked": len(self.pose_hist[tid]),
-                            "frames_required": 5
+                            "frames_tracked": f"{len(self.pose_hist[tid])} frames",
+                            "frames_required": "5 frames"
                         }
                     }
                 }
@@ -537,9 +537,9 @@ class RuleEngine:
                 cause_desc = "Direct strike detected with rapid arm extension in close proximity to another person"
                 joints = ["wrist", "elbow", "shoulder"]
                 metrics = {
-                    "hand_velocity": hand_metrics['max_velocity'],
-                    "interaction_distance": involved_interaction['distance'],
-                    "punch_arm_angle": punch_features[0]['angle']
+                    "hand_velocity": f"{hand_metrics['max_velocity']:.1f} px/frame",
+                    "interaction_distance": f"{involved_interaction['distance']:.1f} px",
+                    "punch_arm_angle": f"{punch_features[0]['angle']:.1f}°"
                 }
                 # Record strike with timestamp
                 self.strike_hist[tid].append(self.frame_count)
@@ -551,9 +551,9 @@ class RuleEngine:
                 cause_desc = "Kicking motion detected in close proximity to another person"
                 joints = ["hip", "knee", "ankle"]
                 metrics = {
-                    "leg_elevation": kick_features[0]['elevation'],
-                    "knee_angle": kick_features[0]['angle'],
-                    "distance_to_person": involved_interaction['distance']
+                    "leg_elevation": f"{kick_features[0]['elevation']:.1f} px",
+                    "knee_angle": f"{kick_features[0]['angle']:.1f}°",
+                    "distance_to_person": f"{involved_interaction['distance']:.1f} px"
                 }
             
             # HIGH: Aggressive behavior patterns
@@ -564,9 +564,9 @@ class RuleEngine:
                 cause_desc = "Rapid punching motion detected near another person"
                 joints = ["wrist", "elbow", "shoulder"]
                 metrics = {
-                    "hand_velocity": hand_metrics['max_velocity'],
-                    "acceleration": hand_metrics['acceleration'],
-                    "proximity": involved_interaction['distance']
+                    "hand_velocity": f"{hand_metrics['max_velocity']:.1f} px/frame",
+                    "acceleration": f"{hand_metrics['acceleration']:.1f} px/frame²",
+                    "proximity": f"{involved_interaction['distance']:.1f} px"
                 }
             
             elif blocking and aggressive_stance and involved_interaction:
@@ -575,7 +575,7 @@ class RuleEngine:
                 rule_name = "DEFENSIVE_STANCE_INTERACTION"
                 cause_desc = "Defensive blocking posture with aggressive stance near another person"
                 joints = ["shoulder", "elbow", "wrist"]
-                metrics = {"proximity": involved_interaction['distance']}
+                metrics = {"proximity": f"{involved_interaction['distance']:.1f} px"}
             
             elif aggressive_stance and involved_interaction and foot_dist < torso_height * 1.2:
                 action = "Confrontational Stance"
@@ -583,7 +583,7 @@ class RuleEngine:
                 rule_name = "AGGRESSIVE_STANCE_CLOSE_PROXIMITY"
                 cause_desc = "Aggressive fighting stance in very close proximity"
                 joints = ["shoulder", "hip"]
-                metrics = {"distance": involved_interaction['distance']}
+                metrics = {"distance": f"{involved_interaction['distance']:.1f} px"}
             
             # MEDIUM: Suspicious behavior
             elif (
@@ -599,8 +599,8 @@ class RuleEngine:
                 cause_desc = "Rapid punching motion without a target (possible testing or intimidation)"
                 joints = ["wrist", "elbow", "shoulder"]
                 metrics = {
-                    "hand_velocity": hand_metrics['max_velocity'],
-                    "acceleration": hand_metrics['acceleration']
+                    "hand_velocity": f"{hand_metrics['max_velocity']:.1f} px/frame",
+                    "acceleration": f"{hand_metrics['acceleration']:.1f} px/frame²"
                 }
             
             elif kick_features:
@@ -609,7 +609,7 @@ class RuleEngine:
                 rule_name = "KICK_NO_PROXIMITY"
                 cause_desc = "Kicking motion detected without nearby person"
                 joints = ["hip", "knee", "ankle"]
-                metrics = {"leg_elevation": kick_features[0]['elevation']}
+                metrics = {"leg_elevation": f"{kick_features[0]['elevation']:.1f} px"}
             
             elif aggressive_stance and torso_metrics and torso_metrics['erratic']:
                 action = "Agitated Movement"
@@ -617,7 +617,11 @@ class RuleEngine:
                 rule_name = "ERRATIC_AGGRESSIVE_MOVEMENT"
                 cause_desc = "Erratic movement with aggressive stance"
                 joints = ["shoulder", "hip", "torso"]
-                metrics = {"torso_speed_std": torso_metrics['erratic']}
+                metrics = {
+                    "torso_avg_speed": f"{torso_metrics['avg_speed']:.1f} px/frame",
+                    "torso_max_speed": f"{torso_metrics['max_speed']:.1f} px/frame",
+                    "erratic_movement": "Yes"
+                }
             
             
 
@@ -638,14 +642,14 @@ class RuleEngine:
                     "joints_involved": joints,
                     "metrics": metrics,
                     "interaction": involved_interaction is not None,
-                    "frame_window": WINDOW
+                    "frame_window": f"{WINDOW} frames"
                 }
                 
                 # Add recent strike count (auto-decays via deque maxlen)
                 recent_strikes = len(self.strike_hist[tid])
                 if recent_strikes > 0:
                     payload["cause"]["recent_strikes"] = recent_strikes
-                    payload["cause"]["strike_window_frames"] = len(self.strike_hist[tid])
+                    payload["cause"]["strike_window_frames"] = f"{len(self.strike_hist[tid])} frames"
             
             results[tid] = payload
         

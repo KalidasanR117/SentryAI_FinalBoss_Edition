@@ -45,7 +45,8 @@ def build_offline_events(
                     "description": "Transformer-based spatiotemporal violence detection",
                     "joints_involved": [],
                     "metrics": {
-                        "violence_score": round(scores[i], 2)
+                        "violence_score": f"{round(scores[i], 2):.2f}",
+                        "confidence": f"{round(scores[i] * 100, 1)}%"
                     }
                 }
             }
