@@ -31,6 +31,8 @@ from pose_face_main import load_or_build_face_db, process_face_recognition
 # 🔥 DISPLAY RESOLUTION (not inference resolution)
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
+# DISPLAY_WIDTH = 1920
+# DISPLAY_HEIGHT = 1080
 BLACKLIST_HOLD_FRAMES = 15  # ~0.5 sec @30fps
 blacklist_hold_counter = 0
 

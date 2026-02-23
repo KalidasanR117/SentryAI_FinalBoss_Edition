@@ -180,7 +180,7 @@ class SOTAFaceAnalyzer:
                         "type": f"Face Detected: {e['name']}",
                         "severity": "CRITICAL" if e['status'] == "blacklist" else "LOW",
                         "time": e['time'],
-                        "details": f"Identity: {e['name']} ({e['status'].upper()}) - Conf: {e['score']:.2f}",
+                        "details": f"Identity: {e['name']}  - Conf: {e['score']:.2f}",
                         "screenshot": str(shot_path) # <--- SAVED PATH
                     })
 
