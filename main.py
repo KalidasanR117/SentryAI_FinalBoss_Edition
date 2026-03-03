@@ -1,10 +1,10 @@
-# ================== HARD BLOCK TENSORFLOW (MUST BE FIRST) ==================
+
 import os
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 os.environ["USE_TF"] = "0"
 os.environ["USE_TORCH"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-# ==========================================================================
+
 
 import cv2
 import argparse
@@ -17,7 +17,7 @@ from pathlib import Path
 from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
 from alerts.notifier import send_critical_alert
 from alerts.telegram_notifier import telegram_bot
-# ========================= LIVE PIPELINE IMPORTS =========================
+
 from core.detector import Detector
 from core.pose_buffer import PoseBuffer
 from core.rule_engine import RuleEngine
@@ -27,13 +27,10 @@ from events.event_manager import EventManager
 from core.camera_manager import CameraManager, CameraConfig, EventSeverity, map_severity_to_enum
 from pose_face_main import load_or_build_face_db, process_face_recognition
 
-# ========================= CONFIG & GLOBALS =========================
-# 🔥 DISPLAY RESOLUTION (not inference resolution)
+
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
-# DISPLAY_WIDTH = 1920
-# DISPLAY_HEIGHT = 1080
-BLACKLIST_HOLD_FRAMES = 15  # ~0.5 sec @30fps
+BLACKLIST_HOLD_FRAMES = 15  
 blacklist_hold_counter = 0
 
 SEVERITY_RANK = {
@@ -54,7 +51,7 @@ CAMERA_MANAGER = None
 ACTIVE_CAMERA_MGR = None
 CURRENT_MODE = "IDLE"  
 
-# 🔥 NEW: GLOBAL PROGRESS TRACKER FOR API
+
 OFFLINE_STATUS = {
     "progress": 0,
     "status": "IDLE",
@@ -79,14 +76,14 @@ SEVERITY_COLORS = {
     "MEDIUM": (0, 255, 255), "LOW": (0, 255, 0)
 }
 
-# Directories
+
 REPORTS_DIR = BASE_DIR / "reports"
 SCREENSHOT_DIR = REPORTS_DIR / "screenshots"
 OFFLINE_REPORT_DIR = REPORTS_DIR / "offline"
 OFFLINE_SCREENSHOT_DIR = OFFLINE_REPORT_DIR / "screenshots"
 for d in [SCREENSHOT_DIR, OFFLINE_SCREENSHOT_DIR]: d.mkdir(parents=True, exist_ok=True)
 
-# ========================= HELPERS =========================
+
 def update_offline_progress(prog, status_msg):
     """Helper to update global status safely"""
     global OFFLINE_STATUS
@@ -211,7 +208,6 @@ def send_offline_summary_alert(events, mode):
 def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE"):
     global RUN_LIVE, STOP_LIVE
 
-    # 🔥 Mark as complete so UI switches to player
     update_offline_progress(100, "Playback Started")
     
     RUN_LIVE = True
@@ -302,10 +298,29 @@ def stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE
         is_alert = False
 
         if mode == "TRANSFORMER" and frame_idx in frame_data_map:
-            lbl, scr, _ = frame_data_map[frame_idx]
+            lbl, scr, face_results = frame_data_map[frame_idx]
             main_label = lbl
             main_score = scr
             
+            # 🔥 Draw recognized faces over Transformer output
+            if face_results:
+                for _, info in face_results.items():
+                    if 'bbox' in info:
+                        name = info.get('name', 'Unknown')
+                        # 🔥 ONLY DRAW IF KNOWN
+                        if name != 'Unknown':
+                            fb = info['bbox']
+                            x1, y1, x2, y2 = map(int, fb)
+                            x1, y1, x2, y2 = int(x1*scale_x), int(y1*scale_y), int(x2*scale_x), int(y2*scale_y)
+                            status = info.get('status', 'unknown')
+                            
+                            color = (255, 0, 0)
+                            if status == 'blacklist': color = (0, 0, 255)
+                            elif status == 'whitelist': color = (0, 255, 0)
+                            
+                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                            cv2.putText(display_frame, f"{name}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
             if "Fight" in lbl: 
                 bar_color = (0, 0, 255)
                 is_alert = True
@@ -406,16 +421,12 @@ def run_pose_offline(video_path):
                         cause=res.get("cause")
                     )
                     active = True
-    
-                    event_mgr.update(frame_idx=frame_idx, label=res["action"], severity=res["severity"], face_ids=[p["track_id"]])
-                    active = True
         
         if not active:
             event_mgr.update(frame_idx=frame_idx, label="Normal", severity="LOW")
 
-        # 🔥 UPDATE PROGRESS
         if frame_idx % 10 == 0:
-            progress = int((frame_idx / total_frames) * 90) # Save 10% for report gen
+            progress = int((frame_idx / total_frames) * 90)
             update_offline_progress(progress, f"Analyzing Movements ({progress}%)")
             print(f"   Progress: {progress}%", end='\r')
 
@@ -443,10 +454,10 @@ def run_pose_offline(video_path):
     stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="POSE")
     send_offline_summary_alert(events, mode="OFFLINE")
 
-# ========================= OFFLINE TRANSFORMER (NO FACE REC) =========================
+# ========================= OFFLINE TRANSFORMER (WITH CONSTANT FACE REC) =========================
 def run_offline(video_path):
-    print("[MODE] TRANSFORMER OFFLINE (Face Rec: OFF)")
-    update_offline_progress(0, "Initializing Transformer Model...")
+    print("[MODE] TRANSFORMER OFFLINE (Face Rec: ON - CONSTANT)")
+    update_offline_progress(0, "Initializing Transformer & Face Models...")
     
     if not Path(video_path).exists(): return
 
@@ -455,6 +466,11 @@ def run_offline(video_path):
         processor = VideoMAEImageProcessor.from_pretrained(VIDEOMAE_MODEL)
         model = VideoMAEForVideoClassification.from_pretrained(VIDEOMAE_MODEL).to(device).eval()
         fight_idx = [k for k, v in model.config.id2label.items() if v.lower() == "fight"][0]
+
+        # 🔥 Init Face Recognition Models
+        scrfd = SCRFD(model_path=str(SCRFD_MODEL))
+        arcface = create_onnx_session(ARCFACE_MODEL)
+        face_db = load_or_build_face_db(scrfd, arcface, str(FACE_GALLERY))
     except Exception as e: print(f"[INIT ERROR] {e}"); return
 
     cap = cv2.VideoCapture(video_path)
@@ -479,14 +495,52 @@ def run_offline(video_path):
     labels = ["Normal"] * total_frames
     scores = np.zeros(total_frames)
     frame_store = {}
+    face_map = {} 
+    
+    # 🔥 PHASE 1: CONSTANT FACE RECOGNITION (EVERY FRAME)
+    print("[INFO] Scanning for faces...")
+    update_offline_progress(10, "Scanning Faces...")
 
+    cache = {}
+    next_face_id = 0
+
+    for i in range(total_frames):
+        # Use a copy so process_face_recognition's default "Unknown" drawing doesn't permanently mark the frame
+        temp_frame = frames[i].copy()
+        _, cache, next_face_id, face_results = process_face_recognition(
+            temp_frame, scrfd, arcface, face_db, cache, next_face_id
+        )
+        
+        # Manually draw ONLY KNOWN faces onto the REAL frame used for screenshots
+        for tid, info in face_results.items():
+            name = info.get('name', 'Unknown')
+            if name != "Unknown":
+                bbox = info['bbox']
+                x1, y1, x2, y2 = map(int, bbox)
+                status = info.get('status', 'unknown')
+                
+                color = (255, 0, 0) # Default Blue for known
+                if status == 'blacklist': color = (0, 0, 255)
+                elif status == 'whitelist': color = (0, 255, 0)
+                
+                cv2.rectangle(frames[i], (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frames[i], name, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        face_map[i] = face_results
+
+        if i % 15 == 0:
+            current_pct = 5 + int((i / total_frames) * 45) # Progress 5% to 50%
+            update_offline_progress(current_pct, f"Scanning Faces ({current_pct}%)")
+
+    
     print("[INFO] Running VideoMAE...")
-    update_offline_progress(10, "Starting VideoMAE Analysis...")
+    update_offline_progress(50, "Starting VideoMAE Analysis...")
 
     for i in range(0, total_frames - NUM_FRAMES, STRIDE):
         if i % int(fps) == 0: frame_store[i] = frames[i].copy()
 
         clip = [cv2.resize(cv2.cvtColor(x, cv2.COLOR_BGR2RGB), FRAME_SIZE) for x in frames[i:i+NUM_FRAMES]]
+        
         inputs = processor(clip, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad(): out = model(**inputs)
@@ -498,7 +552,7 @@ def run_offline(video_path):
             
             if is_dance_video:
                 if fight_score > HIGH_VIOLENCE: labels[j] = "Normal"
-                elif fight_score > LOW_VIOLENCE: labels[j] = "Fight (Low)"
+                elif fight_score > LOW_VIOLENCE: labels[j] = "Fight"
             else:
                 if fight_score >= HIGH_VIOLENCE:
                     labels[j] = "Fight"
@@ -507,39 +561,69 @@ def run_offline(video_path):
                 else:
                     labels[j] = "Normal"
         
-        # 🔥 UPDATE PROGRESS
         if i % 100 == 0: 
-            # Calculate progress from 10% to 90%
-            current_pct = 10 + int((i / total_frames) * 80)
-            update_offline_progress(current_pct, f"Analyzing Complexity ({current_pct}%)")
-            print(f"   MAE Progress: {int(i/total_frames*100)}%", end='\r')
+            current_pct = 50 + int((i / total_frames) * 40) # Progress 50% to 90%
+            update_offline_progress(current_pct, f"Analyzing Violence ({current_pct}%)")
 
     update_offline_progress(90, "Building Event Timeline...")
 
     frame_data_map = {}
     for i in range(total_frames):
-        frame_data_map[i] = (labels[i], scores[i], [])
+        faces_in_frame = face_map.get(i, None)
+        frame_data_map[i] = (labels[i], scores[i], faces_in_frame)
 
-    from events.offline_event_builder import build_offline_events
-    events = build_offline_events(frames, labels, scores, fps, str(OFFLINE_SCREENSHOT_DIR))
+    # 🔥 Build Timeline Events
+    event_mgr = EventManager(fps=fps, source="OFFLINE_TRANSFORMER")
     
-    for e in events:
-        if "severity" not in e:
-            if "Fight" in e["type"]:
-                e["severity"] = "CRITICAL" if e.get("confidence", 0) >= HIGH_VIOLENCE else "HIGH"
-            else:
-                e["severity"] = "LOW"
+    for frame_idx in range(total_frames):
+        current_label = labels[frame_idx]
+        current_score = scores[frame_idx]
         
-    temp_mgr = EventManager(fps=fps, source="OFFLINE_TRANSFORMER")
-    for e in events:
-        temp_mgr.update(
-            frame_idx=int(e["start_time"] * fps),
-            label=e["type"],
-            severity=e.get("severity", "LOW"),
-            confidence=0.95,
-            face_ids=[], 
-            cause=e.get("cause")
-        )
+        blacklisted_faces = []
+        if frame_idx in face_map:
+            blacklisted_faces = [d["name"] for d in face_map[frame_idx].values() if d.get("status") == "blacklist"]
+
+        if blacklisted_faces:
+            screenshot_path = None
+            # Only save a screenshot if it's a NEW encounter (prevents 100 screenshots of the same face)
+            if event_mgr.is_new_event("blacklist_offline", "Blacklisted Person Detected"):
+                screenshot_path = OFFLINE_SCREENSHOT_DIR / f"transformer_blacklist_{frame_idx}.jpg"
+                cv2.imwrite(str(screenshot_path), frames[frame_idx])
+            
+            event_mgr.update(
+                frame_idx=frame_idx,
+                label="Blacklisted Person Detected",
+                severity="CRITICAL",
+                confidence=1.0,
+                face_ids=blacklisted_faces,
+                override="BLACKLIST",
+                screenshot=str(screenshot_path) if screenshot_path else None,
+                cause={
+                    "trigger": "FACE_RECOGNITION",
+                    "rule_name": "BLACKLIST_MATCH",
+                    "metrics": {"faces": blacklisted_faces}
+                }
+            )
+        elif "Fight" in current_label:
+            severity = "CRITICAL" if current_score >= HIGH_VIOLENCE else "HIGH"
+            screenshot_path = None
+            if event_mgr.is_new_event("video_fight", current_label):
+                screenshot_path = OFFLINE_SCREENSHOT_DIR / f"transformer_fight_{frame_idx}.jpg"
+                cv2.imwrite(str(screenshot_path), frames[frame_idx])
+
+            event_mgr.update(
+                frame_idx=frame_idx,
+                label=current_label,
+                severity=severity,
+                confidence=current_score,
+                face_ids=[],
+                screenshot=str(screenshot_path) if screenshot_path else None
+            )
+        else:
+            event_mgr.update(frame_idx=frame_idx, label="Normal", severity="LOW")
+
+    event_mgr.finalize()
+    final_events = event_mgr.export()
 
     update_offline_progress(95, "Generating Final Report...")
 
@@ -548,8 +632,8 @@ def run_offline(video_path):
         from reports.pdf_report import generate_pdf_report
         from llm.summary_generator import generate_llm_summary
         from datetime import datetime
-        buf = adapt_events_for_pdf(events, frame_store)
-        txt = generate_llm_summary(events=buf, mode="OFFLINE")
+        buf = adapt_events_for_pdf(final_events, frame_store)
+        txt = generate_llm_summary(events=buf, mode="OFFLINE_WITH_FACES")
         out = OFFLINE_REPORT_DIR / f"transformer_report_{datetime.now().strftime('%H%M%S')}.pdf"
         generate_pdf_report(buf, txt, str(out))
         telegram_bot.send_report(str(out), txt)
@@ -557,13 +641,10 @@ def run_offline(video_path):
         print("[OFFLINE TRANSFORMER REPORT ERROR]", e)
 
     update_offline_progress(100, "Starting Replay...")
-    stream_replay_to_browser(video_path, frame_data_map, events, fps, mode="TRANSFORMER")
-    send_offline_summary_alert(events, mode="OFFLINE")
-
-# ... imports remain same ...
+    stream_replay_to_browser(video_path, frame_data_map, final_events, fps, mode="TRANSFORMER")
+    send_offline_summary_alert(final_events, mode="OFFLINE")
 
 # ========================= 🔥 FIXED LIVE MODE WITH COOLDOWN =========================
-# ========================= 🔥 FIXED LIVE MODE (DIRECT FACE ALERT) =========================
 def run_live(source):
     global RUN_LIVE, PAUSE_LIVE, STOP_LIVE
     RUN_LIVE = True
@@ -579,7 +660,6 @@ def run_live(source):
 
     print("[MODE] LIVE")
 
-    # ... (Init logic remains same) ...
     try:
         validate_paths()
     except FileNotFoundError as e:
@@ -664,14 +744,10 @@ def run_live(source):
             # 2. RULES
             rule_results = rule_engine.update(persons, objects)
 
-            # 3. FACE (Optimize: Run every 5 frames, or every frame if hardware allows)
-            # if frame_idx % 5 == 0:
+            # 3. FACE
             frame, cache, next_face_id, face_results = process_face_recognition(
                     frame, scrfd, arcface, face_db, cache, next_face_id
                 )
-                # last_face_results = face_results
-            # else:
-                # face_results = last_face_results
             
             track_to_face = match_faces_to_poses(persons, face_results)
 
@@ -703,9 +779,6 @@ def run_live(source):
             # 7. EVENT TRACKING & ALERTS
             current_severity = EventSeverity.NORMAL
             
-            # 🔥🔥🔥 FIX: CHECK RAW FACES, NOT POSE MATCHES 🔥🔥🔥
-            # Old way: check track_to_face (required body+face match)
-            # New way: check face_results directly (requires only face)
             blacklisted_faces = [
                 data["name"] for data in face_results.values()
                 if data.get("status") == "blacklist"
@@ -779,7 +852,6 @@ def run_live(source):
                             result['severity'] = 'LOW'
                             result['color'] = SEVERITY_COLORS['LOW']
                     
-                    # Also keep pose-based blacklist priority for rule engine display
                     elif face_info and face_info.get('status') == 'blacklist':
                         result['severity'] = 'CRITICAL'
                         result['color'] = SEVERITY_COLORS['CRITICAL']
@@ -798,7 +870,6 @@ def run_live(source):
                         screenshot=str(screenshot_path) if screenshot_path else None
                     )
 
-                    # General Alerts (Violence/Theft)
                     if result["severity"] in ["HIGH", "CRITICAL"]:
                         if event_mgr.is_new_event(tid, result["action"]):
                             send_critical_alert(
@@ -812,7 +883,6 @@ def run_live(source):
                                 mode="LIVE"
                             )
 
-                    # Draw Text
                     for sp in scaled_persons:
                         if sp["track_id"] == tid and len(sp["keypoints"]) > 0:
                             x, y = map(int, sp["keypoints"][0])
@@ -822,7 +892,6 @@ def run_live(source):
             if not blacklist_active and not rule_results:
                 event_mgr.update(frame_idx, "Normal", "LOW")
 
-            # FPS & Loop Updates
             now = time.time()
             fps_val = 1 / (now - prev_time + 1e-8)
             prev_time = now
@@ -856,7 +925,7 @@ def run_live(source):
 
     event_mgr.finalize()
     events = event_mgr.export()
-    # ... Report gen ...
+    
     try:
         from reports.event_adapter import adapt_events_for_pdf
         from reports.pdf_report import generate_pdf_report
@@ -871,6 +940,7 @@ def run_live(source):
         telegram_bot.send_report(str(output_path), summary_text)
     except Exception as e:
         print(f"[ERROR] Report generation failed: {e}")
+
 # ========================= ENTRY POINT =========================
 if __name__ == "__main__":
     if API_ONLY:

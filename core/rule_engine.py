@@ -4,10 +4,10 @@ from collections import defaultdict, deque
 from scipy.spatial.distance import euclidean
 
 # ===================== CONFIG =====================
-WINDOW = 15  # frames for motion analysis
-PROXIMITY_THRESHOLD_1 = 120  # pixels for interaction detection
-STRIKE_ZONE_THRESHOLD = 80  # pixels for strike detection
-MIN_RAPID_FRAMES = 3  # frames within WINDOW
+WINDOW = 12  # frames for motion analysis (reduced for faster response)
+PROXIMITY_THRESHOLD = 180  # pixels for interaction detection (increased)
+STRIKE_ZONE_THRESHOLD = 100  # pixels for strike detection (increased)
+MIN_RAPID_FRAMES = 2  # frames within window (reduced from 3)
 
 SEVERITY_COLORS = {
     "CRITICAL": (0, 0, 255),      # Red - Active violence
@@ -42,13 +42,13 @@ KEYPOINTS = {
 class RuleEngine:
     def __init__(self, history=30, fps=30):
         self.pose_hist = defaultdict(lambda: deque(maxlen=history))
-        self.strike_hist = defaultdict(lambda: deque(maxlen=60))  # Last 60 frames for strike tracking
+        self.strike_hist = defaultdict(lambda: deque(maxlen=60))
         self.fps = fps
         self.frame_count = 0
         
     # ==================== GEOMETRIC HELPERS ====================
     
-    def safe_point(self, kps, conf, idx, threshold=0.3):
+    def safe_point(self, kps, conf, idx, threshold=0.25):  # Lower confidence threshold
         """Get keypoint if confidence is sufficient"""
         if idx < len(kps) and conf[idx] > threshold:
             return kps[idx]
@@ -77,15 +77,11 @@ class RuleEngine:
             if pt is not None:
                 pts.append(pt)
         return np.mean(pts, axis=0) if len(pts) >= 2 else None
+    
     def get_dynamic_scale(self, kps, conf):
-        """
-        Calculate a scale factor based on torso height.
-        Returns: Pixel length of the torso (neck to hip).
-        """
-        # Midpoint of shoulders
+        """Calculate scale factor based on torso height"""
         l_sh = self.safe_point(kps, conf, KEYPOINTS["left_shoulder"])
         r_sh = self.safe_point(kps, conf, KEYPOINTS["right_shoulder"])
-        # Midpoint of hips
         l_hip = self.safe_point(kps, conf, KEYPOINTS["left_hip"])
         r_hip = self.safe_point(kps, conf, KEYPOINTS["right_hip"])
 
@@ -94,57 +90,32 @@ class RuleEngine:
             hip_mid = (l_hip + r_hip) / 2
             return euclidean(shoulder_mid, hip_mid)
         
-        return 100.0  # Fallback default if partial occlusion
+        return 100.0  # Fallback
+    
     def get_head_center(self, kps, conf):
         """Get center of head (nose, eyes, ears)"""
         pts = []
-        for idx in range(5):  # nose to ears
+        for idx in range(5):
             pt = self.safe_point(kps, conf, idx)
             if pt is not None:
                 pts.append(pt)
         return np.mean(pts, axis=0) if pts else None
-    def analyze_leg_velocity(self, track_id):
-        seq = self.pose_hist[track_id]
-        if len(seq) < 5:
-            return 0.0
-
-        velocities = []
-
-        for i in range(1, min(len(seq), 6)):
-            prev_k, prev_c = seq[i - 1]
-            curr_k, curr_c = seq[i]
-
-            for side in ["left", "right"]:
-                idx = KEYPOINTS[f"{side}_ankle"]
-                p1 = self.safe_point(prev_k, prev_c, idx)
-                p2 = self.safe_point(curr_k, curr_c, idx)
-                if p1 is not None and p2 is not None:
-                    velocities.append(euclidean(p1, p2))
-
-        return max(velocities) if velocities else 0.0
-
+    
     # ==================== BIOMECHANICAL ANALYSIS ====================
     
     def detect_punch_posture(self, kps, conf):
-        """
-        Detect punching posture:
-        - Extended arm (elbow angle > 140°)
-        - Arm aligned with shoulder
-        - High velocity toward target
-        """
+        """Detect punching posture - RELAXED thresholds"""
         features = []
         
-        # Check both arms
         for side in ['left', 'right']:
             shoulder = self.safe_point(kps, conf, KEYPOINTS[f"{side}_shoulder"])
             elbow = self.safe_point(kps, conf, KEYPOINTS[f"{side}_elbow"])
             wrist = self.safe_point(kps, conf, KEYPOINTS[f"{side}_wrist"])
             
             if all(p is not None for p in [shoulder, elbow, wrist]):
-                # Elbow extension angle
                 angle = self.get_joint_angle(shoulder, elbow, wrist)
-                if angle and angle > 140:  # Nearly straight arm
-                    # Arm extension ratio
+                # RELAXED: 130° instead of 140°
+                if angle and angle > 130:
                     arm_length = euclidean(shoulder, wrist)
                     shoulder_elbow = euclidean(shoulder, elbow)
                     extension = arm_length / (shoulder_elbow + 1e-6)
@@ -160,42 +131,28 @@ class RuleEngine:
         return features
     
     def detect_blocking_posture(self, kps, conf):
-        """
-        Detect defensive blocking:
-        - Arms raised near head
-        - Elbows bent (60-120°)
-        - Hands protecting face/body
-        """
+        """Detect defensive blocking"""
         head = self.get_head_center(kps, conf)
         if head is None:
             return False
         
-        blocking = False
         for side in ['left', 'right']:
             shoulder = self.safe_point(kps, conf, KEYPOINTS[f"{side}_shoulder"])
             elbow = self.safe_point(kps, conf, KEYPOINTS[f"{side}_elbow"])
             wrist = self.safe_point(kps, conf, KEYPOINTS[f"{side}_wrist"])
             
             if all(p is not None for p in [shoulder, elbow, wrist]):
-                # Check if hand near head
                 hand_head_dist = euclidean(wrist, head)
-                
-                # Check elbow bend (defensive angle)
                 angle = self.get_joint_angle(shoulder, elbow, wrist)
                 
-                if hand_head_dist < 100 and angle and 60 < angle < 120:
-                    blocking = True
-                    break
+                # RELAXED: 120 -> 130 distance threshold
+                if hand_head_dist < 130 and angle and 60 < angle < 120:
+                    return True
         
-        return blocking
+        return False
     
     def detect_kicking_posture(self, kps, conf):
-        """
-        Detect kicking:
-        - One leg raised significantly
-        - Knee bent then extending
-        - Hip flexion
-        """
+        """Detect kicking - RELAXED thresholds"""
         features = []
         
         for side in ['left', 'right']:
@@ -204,13 +161,11 @@ class RuleEngine:
             ankle = self.safe_point(kps, conf, KEYPOINTS[f"{side}_ankle"])
             
             if all(p is not None for p in [hip, knee, ankle]):
-                # Leg elevation (hip-knee vertical distance)
                 elevation = abs(hip[1] - knee[1])
-                
-                # Knee angle
                 angle = self.get_joint_angle(hip, knee, ankle)
                 
-                if elevation > 50 or (angle and angle > 150):
+                # RELAXED: 50 -> 40 elevation, 150 -> 140 angle
+                if elevation > 40 or (angle and angle > 140):
                     features.append({
                         'side': side,
                         'elevation': elevation,
@@ -220,13 +175,7 @@ class RuleEngine:
         return features
     
     def detect_aggressive_stance(self, kps, conf):
-        """
-        Detect aggressive fighting stance:
-        - Squared shoulders
-        - Lowered center of gravity
-        - Weight forward
-        """
-        torso = self.get_torso_center(kps, conf)
+        """Detect aggressive fighting stance - RELAXED"""
         l_shoulder = self.safe_point(kps, conf, KEYPOINTS["left_shoulder"])
         r_shoulder = self.safe_point(kps, conf, KEYPOINTS["right_shoulder"])
         l_hip = self.safe_point(kps, conf, KEYPOINTS["left_hip"])
@@ -235,29 +184,26 @@ class RuleEngine:
         if not all(p is not None for p in [l_shoulder, r_shoulder, l_hip, r_hip]):
             return False
         
-        # Check shoulder width (facing camera indicates confrontation)
         shoulder_width = euclidean(l_shoulder, r_shoulder)
-        hip_width = euclidean(l_hip, r_hip)
-        
-        # Lowered stance (shoulders closer to hips)
         torso_compression = euclidean(
             (l_shoulder + r_shoulder) / 2,
             (l_hip + r_hip) / 2
         )
         
-        # Aggressive if squared up and lowered
-        return shoulder_width > 60 and torso_compression < 120
+        # RELAXED: 60 -> 50 shoulder width, 120 -> 140 torso compression
+        return shoulder_width > 50 and torso_compression < 140
     
     # ==================== MOTION ANALYSIS ====================
     
     def analyze_hand_trajectory(self, track_id, torso_height):
-        """Analyze hand movement for striking patterns with SMOOTHING"""
+        """Analyze hand movement - RELAXED thresholds"""
         seq = self.pose_hist[track_id]
-        if len(seq) < 5:
+        if len(seq) < 4:  # Reduced from 5
             return None
 
-        STRIKE_VELOCITY_THRESHOLD = torso_height * 0.4   # px/frame
-        STRIKE_ACCEL_THRESHOLD = 15     # px/frame²
+        # RELAXED: Lower velocity threshold
+        STRIKE_VELOCITY_THRESHOLD = torso_height * 0.25  # Was 0.4
+        STRIKE_ACCEL_THRESHOLD = 10  # Was 15
 
         metrics = {
             'max_velocity': 0.0,
@@ -265,75 +211,35 @@ class RuleEngine:
             'rapid_extension': False
         }
 
-        # 1. EXTRACT RAW WRISTS (Get all valid wrist points first)
-        raw_wrists = []
-        for i in range(1, min(len(seq), 8)):
-            k, c = seq[i]
-            # Check both wrists, prefer right if both exist (simplification)
-            w_r = self.safe_point(k, c, KEYPOINTS["right_wrist"])
-            w_l = self.safe_point(k, c, KEYPOINTS["left_wrist"])
-            
-            # Pick the most confident wrist or just one of them
-            if w_r is not None:
-                raw_wrists.append(w_r)
-            elif w_l is not None:
-                raw_wrists.append(w_l)
-
-        # Skip if not enough data
-        if len(raw_wrists) < 3: 
-            return None
-        
-        # 2. SMOOTHING (Low-Pass Filter)
-        # Average neighbors to remove camera jitter
-        smoothed_points = []
-        for i in range(1, len(raw_wrists)):
-            avg_pt = (raw_wrists[i] + raw_wrists[i-1]) / 2
-            smoothed_points.append(avg_pt)
-            
-        # 3. CALCULATE VELOCITY (On smoothed points only)
         velocities = []
-        for i in range(1, len(smoothed_points)):
-            dist = euclidean(smoothed_points[i], smoothed_points[i-1])
-            velocities.append(dist)
+        for i in range(1, min(len(seq), 8)):
+            prev_k, prev_c = seq[i - 1]
+            curr_k, curr_c = seq[i]
             
-            # Update Max Velocity tracking
-            if dist > metrics['max_velocity']:
-                metrics['max_velocity'] = dist
-
-        # 4. CALCULATE ACCELERATION
-        if len(velocities) >= 2: # Need at least 2 velocities to get diff
+            for side in ['left', 'right']:
+                idx = KEYPOINTS[f"{side}_wrist"]
+                prev_w = self.safe_point(prev_k, prev_c, idx)
+                curr_w = self.safe_point(curr_k, curr_c, idx)
+                
+                if prev_w is not None and curr_w is not None:
+                    vel = euclidean(prev_w, curr_w)
+                    velocities.append(vel)
+                    metrics['max_velocity'] = max(metrics['max_velocity'], vel)
+        
+        if len(velocities) >= 2:
             accel = np.diff(velocities)
             metrics['acceleration'] = float(np.max(accel)) if len(accel) > 0 else 0.0
-
+            
+            # Check if meets strike criteria
             metrics['rapid_extension'] = (
                 metrics['max_velocity'] > STRIKE_VELOCITY_THRESHOLD
                 and metrics['acceleration'] > STRIKE_ACCEL_THRESHOLD
             )
 
         return metrics
-    def detect_fallen_posture(self, kps, conf):
-        """
-        Detect if person is lying down (Aspect Ratio Check).
-        """
-        # Get bounding box of keypoints
-        valid_pts = [p for i, p in enumerate(kps) if conf[i] > 0.5]
-        if len(valid_pts) < 5: return False
-        
-        valid_pts = np.array(valid_pts)
-        min_x, min_y = np.min(valid_pts, axis=0)
-        max_x, max_y = np.max(valid_pts, axis=0)
-        
-        width = max_x - min_x
-        height = max_y - min_y
-        
-        # Logic: If Width is significantly larger than Height, they are likely down
-        # Standard standing ratio is Height > Width. 
-        if width > (height * 1.2): 
-            return True
-        return False
     
     def analyze_torso_movement(self, track_id):
-        """Analyze torso movement for fighting dynamics"""
+        """Analyze torso movement"""
         seq = self.pose_hist[track_id]
         if len(seq) < WINDOW:
             return None
@@ -353,13 +259,13 @@ class RuleEngine:
             return {
                 'avg_speed': float(np.mean(movements)),
                 'max_speed': float(np.max(movements)),
-                'erratic': float(np.std(movements)) > 5  # High variance = erratic
+                'erratic': float(np.std(movements)) > 4  # Was 5
             }
         return None
     
     # ==================== INTERACTION DETECTION ====================
     
-    def detect_proximity_interaction(self, persons,PROXIMITY_THRESHOLD):
+    def detect_proximity_interaction(self, persons):
         """Detect close interactions between people"""
         interactions = []
         
@@ -413,25 +319,23 @@ class RuleEngine:
         results = {}
         self.frame_count += 1
         
-
         # Update pose history
         for p in persons:
             tid = p["track_id"]
             self.pose_hist[tid].append((p["keypoints"], p["confidence"]))
         
         # Detect interactions
-        interactions = self.detect_proximity_interaction(persons,PROXIMITY_THRESHOLD_1)
+        interactions = self.detect_proximity_interaction(persons)
         
         # Analyze each person
         for p in persons:
             tid = p["track_id"]
             kps = p["keypoints"]
             conf = p["confidence"]
-            leg_velocity = self.analyze_leg_velocity(tid)
             torso_height = self.get_dynamic_scale(kps, conf)
+            
             # Skip if insufficient history
-            PROXIMITY_THRESHOLD = torso_height * 1.5
-            if len(self.pose_hist[tid]) < 5:
+            if len(self.pose_hist[tid]) < 4:  # Reduced from 5
                 results[tid] = {
                     "action": "Tracking",
                     "severity": "LOW",
@@ -443,7 +347,7 @@ class RuleEngine:
                         "joints_involved": [],
                         "metrics": {
                             "frames_tracked": f"{len(self.pose_hist[tid])} frames",
-                            "frames_required": "5 frames"
+                            "frames_required": "4 frames"
                         }
                     }
                 }
@@ -452,12 +356,10 @@ class RuleEngine:
             # Analyze postures and movements
             punch_features = self.detect_punch_posture(kps, conf)
             kick_features = self.detect_kicking_posture(kps, conf)
-
-            
             blocking = self.detect_blocking_posture(kps, conf)
             aggressive_stance = self.detect_aggressive_stance(kps, conf)
             
-            hand_metrics = self.analyze_hand_trajectory(tid,torso_height)
+            hand_metrics = self.analyze_hand_trajectory(tid, torso_height)
             torso_metrics = self.analyze_torso_movement(tid)
             
             # Check interactions
@@ -473,45 +375,10 @@ class RuleEngine:
                         strike_detected = self.detect_strike_impact(p, inter['person2'])
                     else:
                         strike_detected = self.detect_strike_impact(inter['person1'], p)
-            # 🔒 Directional + target sanity check (ANTI-WALKING FILTER)
-            if kick_features and involved_interaction:
-                # Get the side that is kicking (left or right)
-                side = kick_features[0]['side']
-                
-                # Get Kicker's Hip and Ankle
-                hip = self.safe_point(kps, conf, KEYPOINTS[f"{side}_hip"])
-                ankle = self.safe_point(kps, conf, KEYPOINTS[f"{side}_ankle"])
-                
-                # Get Victim's Torso
-                # Note: involved_interaction['person2'] might be the kicker or victim depending on ID order
-                # We need the "other" person.
-                other_p = involved_interaction['person1'] if involved_interaction['id2'] == tid else involved_interaction['person2']
-                target_torso = self.get_torso_center(other_p['keypoints'], other_p['confidence'])
-
-                if hip is not None and ankle is not None and target_torso is not None:
-                    # 1. Calculate Vectors
-                    kick_vector = ankle - hip
-                    target_vector = target_torso - hip
-                    
-                    # 2. Check Alignment (Angle)
-                    # If angle is > 45 degrees, they are kicking "past" the person (walking/running), not "at" them.
-                    attack_angle = self.angle_between_vectors(kick_vector, target_vector)
-                    
-                    # 3. Check Dynamic Reach
-                    # Valid kick distance is usually < 2.5x torso height (leg length + step)
-                    foot_dist = euclidean(ankle, target_torso)
-                    max_reach = torso_height * 2.5
-                    
-                    # INVALIDATE IF: Not aiming at target OR Target is out of range
-                    if attack_angle > 65 or foot_dist > max_reach:
-                        kick_features = []  # Discard false positive
-
-            rapid_count = 0
-            if hand_metrics and hand_metrics['rapid_extension']:
-                self.strike_hist[tid].append(self.frame_count)
-
+            
+            # Count recent strikes
             rapid_count = len(self.strike_hist[tid])
-
+            
             # ==================== CLASSIFICATION ====================
             
             action = "Normal Motion"
@@ -520,17 +387,9 @@ class RuleEngine:
             cause_desc = None
             joints = []
             metrics = {}
-            is_fallen = self.detect_fallen_posture(kps, conf)
-
-            # if is_fallen and involved_interaction:
-            #     action = "Ground Fight / Person Down"
-            #     severity = "CRITICAL"
-            #     rule_name = "PERSON_FALLEN_IN_FIGHT"
-            #     cause_desc = "Person detected on ground in close proximity to another"
-            #     joints = ["shoulder", "hip"] # General body alignment
-            #     metrics = {"aspect_ratio_width": "high"}
+            
             # CRITICAL: Active physical violence
-            if strike_detected and punch_features and hand_metrics and hand_metrics['rapid_extension']:
+            if strike_detected and hand_metrics and hand_metrics['rapid_extension']:
                 action = "Active Physical Assault"
                 severity = "CRITICAL"
                 rule_name = "STRIKE_IMPACT_DETECTED"
@@ -538,13 +397,12 @@ class RuleEngine:
                 joints = ["wrist", "elbow", "shoulder"]
                 metrics = {
                     "hand_velocity": f"{hand_metrics['max_velocity']:.1f} px/frame",
-                    "interaction_distance": f"{involved_interaction['distance']:.1f} px",
-                    "punch_arm_angle": f"{punch_features[0]['angle']:.1f}°"
+                    "interaction_distance": f"{involved_interaction['distance']:.1f} px" if involved_interaction else "N/A"
                 }
-                # Record strike with timestamp
                 self.strike_hist[tid].append(self.frame_count)
             
-            elif kick_features and involved_interaction and involved_interaction['distance'] < 100 and (leg_velocity > 35 or kick_features[0]['angle'] > 150):
+            # RELAXED: Kicking with lower thresholds
+            elif kick_features and involved_interaction and involved_interaction['distance'] < 150:
                 action = "Kicking Attack"
                 severity = "CRITICAL"
                 rule_name = "KICK_IN_PROXIMITY"
@@ -557,7 +415,7 @@ class RuleEngine:
                 }
             
             # HIGH: Aggressive behavior patterns
-            elif punch_features and hand_metrics and hand_metrics['rapid_extension'] and involved_interaction:
+            elif hand_metrics and hand_metrics['rapid_extension'] and involved_interaction:
                 action = "Aggressive Striking Motion"
                 severity = "HIGH"
                 rule_name = "RAPID_STRIKE_NEAR_PERSON"
@@ -569,15 +427,15 @@ class RuleEngine:
                     "proximity": f"{involved_interaction['distance']:.1f} px"
                 }
             
-            elif blocking and aggressive_stance and involved_interaction:
+            elif blocking and involved_interaction:
                 action = "Defensive Fighting Posture"
                 severity = "HIGH"
                 rule_name = "DEFENSIVE_STANCE_INTERACTION"
-                cause_desc = "Defensive blocking posture with aggressive stance near another person"
+                cause_desc = "Defensive blocking posture near another person"
                 joints = ["shoulder", "elbow", "wrist"]
                 metrics = {"proximity": f"{involved_interaction['distance']:.1f} px"}
             
-            elif aggressive_stance and involved_interaction and foot_dist < torso_height * 1.2:
+            elif aggressive_stance and involved_interaction and involved_interaction['distance'] < 120:
                 action = "Confrontational Stance"
                 severity = "HIGH"
                 rule_name = "AGGRESSIVE_STANCE_CLOSE_PROXIMITY"
@@ -586,13 +444,7 @@ class RuleEngine:
                 metrics = {"distance": f"{involved_interaction['distance']:.1f} px"}
             
             # MEDIUM: Suspicious behavior
-            elif (
-    punch_features
-    and hand_metrics
-    and hand_metrics['rapid_extension']
-    and rapid_count >= MIN_RAPID_FRAMES
-):
-
+            elif hand_metrics and hand_metrics['rapid_extension'] and rapid_count >= MIN_RAPID_FRAMES:
                 action = "Shadow Boxing / Air Punching"
                 severity = "MEDIUM"
                 rule_name = "RAPID_PUNCH_NO_TARGET"
@@ -603,7 +455,7 @@ class RuleEngine:
                     "acceleration": f"{hand_metrics['acceleration']:.1f} px/frame²"
                 }
             
-            elif kick_features:
+            elif kick_features and not involved_interaction:
                 action = "Kicking Motion (No Target)"
                 severity = "MEDIUM"
                 rule_name = "KICK_NO_PROXIMITY"
@@ -623,9 +475,6 @@ class RuleEngine:
                     "erratic_movement": "Yes"
                 }
             
-            
-
-
             # Build result
             payload = {
                 "action": action,
@@ -645,10 +494,9 @@ class RuleEngine:
                     "frame_window": f"{WINDOW} frames"
                 }
                 
-                # Add recent strike count (auto-decays via deque maxlen)
-                recent_strikes = len(self.strike_hist[tid])
-                if recent_strikes > 0:
-                    payload["cause"]["recent_strikes"] = recent_strikes
+                # Add recent strike count
+                if rapid_count > 0:
+                    payload["cause"]["recent_strikes"] = rapid_count
                     payload["cause"]["strike_window_frames"] = f"{len(self.strike_hist[tid])} frames"
             
             results[tid] = payload
