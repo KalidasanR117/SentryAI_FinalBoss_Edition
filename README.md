@@ -66,7 +66,7 @@ The system supports two decision paths:
 | Backend Server | Uvicorn (ASGI) |
 | Reporting | FPDF |
 | Summarization | Ollama (local LLM) + Mistral |
-| Frontend | React + TypeScript |
+| Frontend | React + TypeScript ([sentry-watch](https://github.com/KalidasanR117/sentry-watch)) |
 
 ---
 
@@ -80,6 +80,14 @@ The system supports two decision paths:
 | Storage | 20–50 GB free disk space |
 | Camera | USB webcam / IP camera (RTSP) |
 | Internet | Required for alerts and model updates |
+
+---
+
+## 🔗 Related Repositories
+
+- **Frontend Dashboard:** [sentry-watch](https://github.com/KalidasanR117/sentry-watch) — the React + TypeScript web dashboard (Live Monitor, Video Analysis, Reports, Deep Face Lab) that connects to this backend.
+
+This repository (`sentry`) contains the **backend** — detection pipelines, models, alerting, and reporting logic. The frontend UI lives in a separate repo linked above.
 
 ---
 
@@ -139,6 +147,15 @@ python app.py
 
 # Or run the live camera pipeline directly
 python after_camera_main.py
+```
+
+To use the full web dashboard, clone and run the frontend separately:
+
+```bash
+git clone https://github.com/KalidasanR117/sentry-watch.git
+cd sentry-watch
+npm install
+npm run dev
 ```
 
 Then open the dashboard to:
